@@ -68,10 +68,17 @@ export async function startReconstruction(file, options) {
  * SSE first; on error it degrades to 1s polling rather than going silent,
  * because a stalled progress bar is indistinguishable from a hung engine.
  */
-export function watchJob(id, { onUpdate, onDone, onError }) {
+export function watchJob(id, { onUpdate, onDone, onError, onLog }) {
   let stopped = false;
   let source = null;
   let timer = null;
+  let logSeq = 0;
+
+  const takeLines = (lines) => {
+    if (!lines?.length) return;
+    logSeq = Math.max(logSeq, lines[lines.length - 1].seq || 0);
+    onLog?.(lines);
+  };
 
   const finish = (job) => {
     if (stopped) return;
@@ -94,6 +101,12 @@ export function watchJob(id, { onUpdate, onDone, onError }) {
       try {
         const job = await getJob(id);
         onUpdate?.(job);
+        // Pull whatever log lines appeared since the last poll, so the fallback
+        // path is not silent either.
+        try {
+          const response = await fetch(`${API}/api/reconstruct/${id}/log?since=${logSeq}`);
+          if (response.ok) takeLines((await response.json()).lines);
+        } catch { /* log is best-effort */ }
         if (job.status === 'complete' || job.status === 'error' || job.status === 'cancelled') finish(job);
       } catch { /* keep polling; the server may be restarting */ }
     }, 1000);
@@ -102,6 +115,7 @@ export function watchJob(id, { onUpdate, onDone, onError }) {
   try {
     source = new EventSource(`${API}/api/reconstruct/${id}/stream`);
     source.addEventListener('progress', (event) => onUpdate?.(JSON.parse(event.data)));
+    source.addEventListener('log', (event) => takeLines(JSON.parse(event.data).lines));
     source.addEventListener('done', (event) => finish(JSON.parse(event.data)));
     source.addEventListener('error', (event) => {
       // An SSE `error` event is both "the server sent an error payload" and

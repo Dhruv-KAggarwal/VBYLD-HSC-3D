@@ -108,6 +108,11 @@ function jobPayload(job) {
     elapsedMs: job.elapsedMs ?? null,
     etaMs: job.status === 'processing' ? (job.etaMs ?? null) : 0,
     cancelled: Boolean(job.cancelled),
+    // How long since ANY engine wrote a line. This is the stall signal: the
+    // progress bar alone cannot distinguish "this stage is slow" from "this
+    // process died", and some stages legitimately go minutes without output.
+    idleMs: job.lastOutputAt ? Date.now() - job.lastOutputAt : null,
+    logSeq: job.logSeq ?? 0,
     warning: job.warning,
     error: job.error,
     result: job.result,
@@ -228,11 +233,27 @@ async function openJobStream(id, request, response) {
   };
   request.on('close', close);
 
+  // Per-socket cursor into the job log, so each client is sent only the lines
+  // it has not seen rather than the whole buffer every second.
+  let sentSeq = 0;
+  const pumpLog = (live) => {
+    if (!live?.log?.length) return;
+    const fresh = live.log.filter((line) => line.seq > sentSeq);
+    if (!fresh.length) return;
+    sentSeq = fresh[fresh.length - 1].seq;
+    // Chunked: one SSE frame per batch keeps the payload bounded when a noisy
+    // stage emits hundreds of lines between polls.
+    for (let i = 0; i < fresh.length; i += 120) {
+      writeSse(response, 'log', { lines: fresh.slice(i, i + 120) });
+    }
+  };
+
   const pump = async () => {
     if (closed) return;
     const telemetry = await sampleTelemetry();
     const live = jobs.get(id);
     if (live) {
+      pumpLog(live);
       writeSse(response, 'progress', { ...jobPayload(live), telemetry });
       if (live.status !== 'processing') {
         writeSse(response, 'done', { ...jobPayload(live), telemetry });
@@ -366,6 +387,18 @@ async function handle(request, response) {
   if (request.method === 'GET' && streamMatch) {
     await openJobStream(streamMatch[1], request, response);
     return;
+  }
+
+  // Polling fallback for the log, used when SSE is unavailable (a proxy that
+  // buffers event streams, for instance). `since` is the last sequence number
+  // the client holds.
+  const logMatch = url.pathname.match(/^\/api\/reconstruct\/([^/]+)\/log$/);
+  if (request.method === 'GET' && logMatch) {
+    const job = jobs.get(logMatch[1]);
+    if (!job) return send(response, 404, { error: 'Job not found.' });
+    const since = Number(url.searchParams.get('since') || 0);
+    const lines = (job.log || []).filter((line) => line.seq > since);
+    return send(response, 200, { lines, logSeq: job.logSeq ?? 0, idleMs: job.lastOutputAt ? Date.now() - job.lastOutputAt : null });
   }
 
   const match = url.pathname.match(/^\/api\/reconstruct\/([^/]+)$/);

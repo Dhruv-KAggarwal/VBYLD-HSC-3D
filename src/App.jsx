@@ -30,6 +30,13 @@ function formatBytes(bytes) {
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function clockOf(at) {
+  if (!at) return '--:--:--';
+  const d = new Date(at);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, '0')).join(':');
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return '—';
   const m = Math.floor(seconds / 60);
@@ -55,6 +62,10 @@ export default function App() {
   const [sceneInfo, setSceneInfo] = useState(null);
   const [measureText, setMeasureText] = useState('');
   const [navHint, setNavHint] = useState(NAV_MODES[0].hint);
+  // Raw engine lines are hidden by default: COLMAP and OpenMVS emit hundreds
+  // per second and bury the narration. The toggle shows everything.
+  const [showEngineLines, setShowEngineLines] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
 
   const [options, setOptions] = useState({
     quality: 'Balanced',
@@ -105,9 +116,14 @@ export default function App() {
   useEffect(() => { viewerRef.current?.setShading(display.shading); }, [display.shading]);
   useEffect(() => { viewerRef.current?.setMeasureMode(display.measure); }, [display.measure]);
 
+  const visibleLog = useMemo(
+    () => (showEngineLines ? log : log.filter((entry) => entry.kind !== 'engine')),
+    [log, showEngineLines],
+  );
+
   useEffect(() => {
-    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [log]);
+    if (autoScroll && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [visibleLog, autoScroll]);
 
   // --- Server state --------------------------------------------------------
   const refreshJobs = useCallback(async () => {
@@ -183,13 +199,22 @@ export default function App() {
       pushLog(`Job ${id} accepted; reconstruction queued`, 'ok');
       unwatchRef.current?.();
       unwatchRef.current = watchJob(id, {
-        onUpdate: (next) => {
-          setJob(next);
-          if (next.stage && next.stage !== start.lastStage) {
-            start.lastStage = next.stage;
-            pushLog(next.stage);
-          }
-        },
+        onUpdate: (next) => setJob(next),
+        // Every line the terminal prints, as the engines print it.
+        onLog: (lines) => setLog((prev) => {
+          const merged = prev.concat(lines.map((line) => ({
+            text: line.message,
+            kind: line.level === 'error' ? 'error'
+              : line.level === 'warn' ? 'warn'
+                : line.level === 'ok' ? 'ok'
+                  : line.level === 'engine' ? 'engine' : 'info',
+            at: line.at,
+            seq: line.seq,
+          })));
+          // Bounded: a long run emits tens of thousands of lines and React
+          // re-renders the whole list.
+          return merged.length > 1200 ? merged.slice(merged.length - 1200) : merged;
+        }),
         onDone: async (next) => {
           setJob(next);
           setBusy(false);
@@ -235,8 +260,20 @@ export default function App() {
   }, [start]);
 
   const stages = job?.stages || [];
-  const progress = Math.round((job?.progress || 0) * 100);
+  // job.progress and stage.progress are ALREADY percentages (the tracker emits
+  // Math.round(fraction * 1000) / 10). Multiplying by 100 again is what put
+  // "900%" on the bar.
+  const progress = Math.max(0, Math.min(100, Number(job?.progress) || 0));
   const telemetry = job?.telemetry || health?.telemetry;
+
+  // Stall detection. The bar cannot tell "slow stage" from "dead process", and
+  // some stages legitimately run minutes without printing (global bundle
+  // adjustment, atlas packing). Warn at 2 minutes of silence, escalate at 10.
+  const idleMs = job?.idleMs ?? null;
+  const stall = !busy || idleMs == null ? null
+    : idleMs > 600000 ? { level: 'bad', text: `No engine output for ${formatDuration(idleMs / 1000)}. The stage may be stuck — check the log below, or cancel.` }
+      : idleMs > 120000 ? { level: 'warn', text: `Quiet for ${formatDuration(idleMs / 1000)}. Normal during bundle adjustment and atlas packing.` }
+        : null;
 
   const onPickFile = (picked) => {
     if (!picked) return;
@@ -559,26 +596,55 @@ export default function App() {
               </div>
               <div className="text-right">
                 <div className="font-mono text-lg text-jet-400">{progress}%</div>
-                {job?.etaSeconds > 0 && <div className="kicker">~{formatDuration(job.etaSeconds)} left</div>}
+                {job?.etaMs > 0 && <div className="kicker">~{formatDuration(job.etaMs / 1000)} left</div>}
+                {job?.elapsedMs > 0 && <div className="kicker">{formatDuration(job.elapsedMs / 1000)} elapsed</div>}
               </div>
             </div>
 
-            <div className="h-1.5 rounded-full bg-ink-800 overflow-hidden mb-4">
+            <div className="h-1.5 rounded-full bg-ink-800 overflow-hidden mb-2">
               <div className="h-full bg-jet-500 transition-[width] duration-300" style={{ width: `${progress}%` }} />
             </div>
 
+            {stall && (
+              <div className={`panel px-3 py-2 mb-3 text-xs ${
+                stall.level === 'bad'
+                  ? 'border-red-900/60 bg-red-950/30 text-red-200'
+                  : 'border-amber-900/50 bg-amber-950/20 text-amber-ui'
+              }`}
+              >
+                {stall.text}
+              </div>
+            )}
+            {busy && !stall && idleMs != null && (
+              <div className="kicker mb-3">Engine active · last output {Math.round(idleMs / 1000)}s ago</div>
+            )}
+            {!busy && <div className="mb-3" />}
+
             <div className="grid grid-cols-3 gap-1.5">
               {stages.map((stage) => {
-                const pct = Math.round((stage.progress || 0) * 100);
-                const done = pct >= 100;
-                const active = !done && pct > 0;
+                // Already a percentage, same as job.progress.
+                const pct = Math.max(0, Math.min(100, Number(stage.progress) || 0));
+                const done = stage.status === 'complete' || pct >= 100;
+                const active = !done && (stage.status === 'active' || pct > 0);
                 return (
-                  <div key={stage.key} className={`panel px-2.5 py-2 ${active ? 'border-jet-500/60' : ''}`}>
+                  <div
+                    key={stage.key}
+                    className={`panel px-2.5 py-2 ${active ? 'border-jet-500/60' : ''}`}
+                    title={stage.detail || stage.label}
+                  >
                     <div className="flex items-center gap-1.5">
                       <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${done ? 'bg-jet-500' : active ? 'bg-amber-ui live-dot' : 'bg-ink-600'}`} />
                       <span className="text-[11px] truncate">{stage.label}</span>
                     </div>
-                    <div className="kicker mt-0.5">{done ? 'done' : active ? `${pct}%` : 'queued'}</div>
+                    <div className="kicker mt-0.5 flex justify-between gap-2">
+                      <span>{done ? 'done' : active ? `${pct.toFixed(0)}%` : 'queued'}</span>
+                      {stage.durationMs > 0 && <span className="text-mist-400">{formatDuration(stage.durationMs / 1000)}</span>}
+                    </div>
+                    {active && (
+                      <div className="h-0.5 mt-1 rounded-full bg-ink-800 overflow-hidden">
+                        <div className="h-full bg-amber-ui" style={{ width: `${pct}%` }} />
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -597,24 +663,57 @@ export default function App() {
 
           {/* live log */}
           <div className="border-l border-ink-700 flex flex-col min-h-0">
-            <div className="px-3 py-2 border-b border-ink-700 flex items-center justify-between">
-              <p className="kicker">Engine log</p>
-              <button className="btn py-0.5 px-2 text-[11px]" onClick={() => setLog([])}>Clear</button>
+            <div className="px-3 py-2 border-b border-ink-700 flex items-center justify-between gap-2">
+              <p className="kicker shrink-0">Engine log</p>
+              <div className="flex items-center gap-1">
+                <button
+                  className={`btn py-0.5 px-2 text-[11px] ${showEngineLines ? 'btn-toggle-on' : ''}`}
+                  onClick={() => setShowEngineLines((v) => !v)}
+                  title="Raw COLMAP / OpenMVS / ffmpeg output"
+                >raw</button>
+                <button
+                  className={`btn py-0.5 px-2 text-[11px] ${autoScroll ? 'btn-toggle-on' : ''}`}
+                  onClick={() => setAutoScroll((v) => !v)}
+                  title="Follow new lines"
+                >follow</button>
+                <button className="btn py-0.5 px-2 text-[11px]" onClick={() => setLog([])}>clear</button>
+              </div>
             </div>
-            <div ref={logRef} className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5">
-              {log.length === 0 && <div className="log-line text-mist-400">Waiting for a job…</div>}
-              {log.map((entry, index) => (
+            <div
+              ref={logRef}
+              className="flex-1 overflow-y-auto px-3 py-2"
+              onScroll={(e) => {
+                // Turning autoscroll off the moment the user scrolls up is the
+                // difference between a readable log and one that yanks away.
+                const el = e.currentTarget;
+                const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+                if (!atBottom && autoScroll) setAutoScroll(false);
+              }}
+            >
+              {visibleLog.length === 0 && (
+                <div className="log-line text-mist-400">
+                  {busy ? 'Waiting for engine output…' : 'No job running.'}
+                </div>
+              )}
+              {visibleLog.map((entry) => (
                 <div
-                  key={index}
-                  className={`log-line ${
+                  key={entry.seq ?? `${entry.at}-${entry.text}`}
+                  className={`log-line whitespace-pre-wrap break-all ${
                     entry.kind === 'error' ? 'text-red-300'
                       : entry.kind === 'warn' ? 'text-amber-ui'
-                        : entry.kind === 'ok' ? 'text-jet-400' : 'text-mist-400'
+                        : entry.kind === 'ok' ? 'text-jet-400'
+                          : entry.kind === 'engine' ? 'text-mist-400/55'
+                            : 'text-mist-300'
                   }`}
                 >
+                  <span className="text-mist-400/40">{clockOf(entry.at)} </span>
                   {entry.text}
                 </div>
               ))}
+            </div>
+            <div className="px-3 py-1.5 border-t border-ink-700 kicker flex justify-between">
+              <span>{visibleLog.length} / {log.length} lines</span>
+              {!autoScroll && <span className="text-amber-ui">paused — press follow</span>}
             </div>
           </div>
         </section>
