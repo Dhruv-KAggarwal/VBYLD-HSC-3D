@@ -11,8 +11,10 @@ export class ModelViewer {
     this.camera.position.set(140, 90, 160);
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.95;
+    // Do not apply cinematic exposure to reconstructed photography; it can
+    // darken or desaturate the orthophoto and dense-cloud vertex colours.
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
     this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
@@ -97,33 +99,35 @@ export class ModelViewer {
     });
     gltf.scene.traverse((node) => {
       if (node.isMesh) {
-        const hasMap = Boolean(node.material?.map);
+        const sourceMaterial = node.material;
+        const hasMap = Boolean(sourceMaterial?.map);
+        const hasVertexColors = Boolean(node.geometry.getAttribute('color'));
         if (hasMap) {
-          node.material.map.colorSpace = THREE.SRGBColorSpace;
-          node.material.map.anisotropy = 8;
-          node.material.map.needsUpdate = true;
+          sourceMaterial.map.colorSpace = THREE.SRGBColorSpace;
+          sourceMaterial.map.anisotropy = 8;
+          sourceMaterial.map.needsUpdate = true;
         }
-        const material = new THREE.MeshStandardMaterial({
-          map: hasMap ? node.material.map : null,
-          vertexColors: !hasMap,
+        const material = new THREE.MeshBasicMaterial({
+          map: hasMap ? sourceMaterial.map : null,
+          vertexColors: !hasMap && hasVertexColors,
           color: 0xffffff,
-          metalness: 0.02,
-          roughness: 0.9,
           side: THREE.DoubleSide,
-          flatShading: false,
-          envMapIntensity: 0.2,
+          toneMapped: false,
         });
         node.material = material;
         node.castShadow = false;
         node.receiveShadow = false;
       }
       if (node.isPoints) {
-        node.material.size = 1.6;
-        node.material.sizeAttenuation = true;
-        node.material.vertexColors = true;
-        node.material.transparent = true;
-        node.material.opacity = 0.92;
-        node.material.depthWrite = false;
+        node.material = new THREE.PointsMaterial({
+          vertexColors: true,
+          size: 2.2,
+          sizeAttenuation: true,
+          transparent: true,
+          opacity: 1,
+          depthWrite: false,
+          toneMapped: false,
+        });
       }
     });
     this.root.add(gltf.scene);
@@ -139,8 +143,15 @@ export class ModelViewer {
     const center = box.getCenter(new THREE.Vector3());
     const horiz = Math.max(size.x, size.z, 8);
     const radius = Math.max(horiz, size.y, 8);
+    const verticalFov = THREE.MathUtils.degToRad(this.camera.fov);
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov * 0.5) * this.camera.aspect);
+    const fitRadius = Math.max(size.length() * 0.5, 4);
+    const fitDistance = fitRadius / Math.sin(Math.min(verticalFov, horizontalFov) * 0.5) * 1.5;
     this.controls.target.copy(center);
-    this.camera.position.set(center.x, center.y + size.y * 0.85 + horiz * 0.22, center.z + horiz * 0.95);
+    this.camera.position.copy(center).addScaledVector(
+      new THREE.Vector3(0.16, 0.64, 0.75).normalize(),
+      fitDistance,
+    );
     this.camera.near = Math.max(0.05, radius / 500);
     this.camera.far = radius * 40;
     this.camera.updateProjectionMatrix();

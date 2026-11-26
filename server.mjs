@@ -132,7 +132,10 @@ function fileFor(job, kind) {
   const recovered = join(root, job?.id || '', 'products');
   const latest = resolve('output/latest');
   const table = {
-    glb: [job?.result?.model, join(recovered, 'terrain.glb'), join(latest, 'terrain.glb')],
+    // Prefer the full-resolution photo-coloured surface when a job has one.
+    // terrain.glb is the lighter DSM and is still available as kind=terrain.
+    glb: [join(recovered, 'model.glb'), job?.result?.texturedModel, job?.result?.model, join(recovered, 'terrain.glb'), join(latest, 'terrain.glb')],
+    terrain: [job?.result?.terrain, join(recovered, 'terrain.glb'), join(latest, 'terrain.glb')],
     full: [join(recovered, 'terrain-full.glb'), join(latest, 'terrain-full.glb'), join(recovered, 'terrain.glb')],
     cloud: [job?.result?.pointCloud, join(recovered, 'pointcloud.ply'), join(latest, 'pointcloud.ply')],
     mesh: [job?.result?.mesh, join(recovered, 'terrain.ply'), join(latest, 'terrain.ply')],

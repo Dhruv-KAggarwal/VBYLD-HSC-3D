@@ -46,7 +46,7 @@ app.innerHTML = `
           <div class="card config-card"><div class="card-head"><div><span class="step">02</span><div><p class="kicker">RECONSTRUCTION PROFILE</p><h3>Set mission parameters</h3></div></div></div><label class="field-label">OUTPUT FOCUS</label><div class="profile-grid"><button class="profile active" data-quality="Rapid"><b>Rapid</b><small>2 fps floor · real surface</small><span>✓</span></button><button class="profile" data-quality="Balanced"><b>Balanced</b><small>Sharper surface</small><span>✓</span></button><button class="profile" data-quality="Detailed"><b>Detailed map</b><small>Finest grid + texture</small><span>✓</span></button></div><div class="config-row"><label><span>Camera altitude</span><b><input id="altitude" value="82" type="number"> m AGL</b></label><label><span>Coordinate system</span><b><select id="crs"><option>Local tangent plane</option><option>WGS 84 / UTM 43N</option><option>WGS 84 / UTM 44N</option></select></b></label></div><div class="tune-row"><label><span>Frames</span><input id="frames" type="number" min="12" max="240" placeholder="Auto"></label><label><span>CPU threads</span><input id="threads" type="number" min="1" max="64" placeholder="Auto"></label></div><p class="tune-note" id="tune-note">Leave frames and threads blank. Rapid keeps at least two frames per second on flights under two minutes (never under 72), so a fast pass still overlaps and a surface gets built. Threads follow this PC’s GPU and RAM.</p><label class="field-label">OUTPUTS</label><div class="output-chips"><button class="chip active">Textured mesh</button><button class="chip active">Point cloud</button><button class="chip active">Orthomosaic</button><button class="chip active">DEM mesh</button></div><button class="generate-btn" id="generate" disabled><span>◈</span> Generate scene <kbd>Ctrl ↵</kbd></button><p class="estimate" id="estimate">Upload a capture package to estimate runtime</p></div>
         </section>
         <section class="card pipeline-card"><div class="pipeline-head"><div><p class="kicker">PROCESSING PIPELINE</p><h3 id="pipeline-title">Waiting for capture package</h3></div><div class="pipeline-meta"><span class="pipeline-time" id="pipeline-time">—</span><span class="pipeline-eta" id="pipeline-eta"></span></div></div><div class="pipeline-steps" id="pipeline-steps"></div><div class="progress-wrap"><div class="progress-label"><span id="stage-label">Awaiting mission start</span><b id="progress-value">0%</b></div><div class="progress-track"><i id="progress-bar"></i></div></div><div class="telemetry" id="telemetry"><span>GPU <b id="tel-gpu">—</b></span><span>VRAM <b id="tel-vram">—</b></span><span>RAM <b id="tel-ram">—</b></span><span>CPU <b id="tel-cpu">—</b></span><span>TEMP <b id="tel-temp">—</b></span></div></section>
-        <section class="scene-section"><div class="section-title"><div><p class="kicker">SCENE PREVIEW</p><h3>Operational digital twin</h3></div><div class="layer-controls">${Object.entries({ terrain: 'Terrain', points: 'Photo points', grid: 'Grid' }).map(([key, label]) => `<button class="layer${key === 'points' ? '' : ' active'}" data-layer="${key}"><i></i>${label}</button>`).join('')}</div></div><div class="scene-card"><canvas id="scene-canvas"></canvas><div class="load-overlay" id="load-overlay" hidden><b id="load-pct">0%</b><small>Streaming terrain mesh</small></div><div class="scene-overlay"><span class="map-pill">◉ <span id="scene-state">PREVIEW / NO MODEL YET</span></span><span class="north">N</span><div class="scene-legend"><span><i class="legend-structure"></i>SHIFT-CLICK MEASURE</span><span><i class="legend-road"></i>ORBIT DRAG</span><span><i class="legend-terrain"></i>SCROLL ZOOM</span></div></div></div><div class="scene-footer"><span id="scene-caption">Upload a single-pass flight or load the last reconstructed scene</span><div class="download-bar" id="download-bar" hidden><a id="dl-glb">GLB</a><a id="dl-cloud">PLY cloud</a><a id="dl-mesh">PLY mesh</a><a id="dl-ortho">Ortho</a></div></div></section>
+        <section class="scene-section"><div class="section-title"><div><p class="kicker">SCENE PREVIEW</p><h3>Operational digital twin</h3></div><div class="layer-controls">${Object.entries({ terrain: 'Surface mesh', points: 'Photo points', grid: 'Grid' }).map(([key, label]) => `<button class="layer${key === 'points' ? '' : ' active'}" data-layer="${key}"><i></i>${label}</button>`).join('')}</div></div><div class="scene-card"><canvas id="scene-canvas"></canvas><div class="load-overlay" id="load-overlay" hidden><b id="load-pct">0%</b><small>Streaming detailed photo mesh</small></div><div class="scene-overlay"><span class="map-pill">◉ <span id="scene-state">PREVIEW / NO MODEL YET</span></span><span class="north">N</span><div class="scene-legend"><span><i class="legend-structure"></i>SHIFT-CLICK MEASURE</span><span><i class="legend-road"></i>ORBIT DRAG</span><span><i class="legend-terrain"></i>SCROLL ZOOM</span></div></div></div><div class="scene-footer"><span id="scene-caption">Upload a single-pass flight or load the last reconstructed scene</span><div class="download-bar" id="download-bar" hidden><a id="dl-glb">Photo mesh GLB</a><a id="dl-terrain">Terrain DSM</a><a id="dl-cloud">PLY cloud</a><a id="dl-mesh">PLY mesh</a><a id="dl-ortho">Ortho</a></div></div></section>
       </div>
       <div class="view hidden" id="models-view"><section class="page-heading"><p class="kicker">3D OUTPUTS</p><h2>Mission library</h2><p>Local reconstruction packages ready for inspection, measurement and export.</p></section><div class="model-grid" id="models-grid"></div><div class="empty-state" id="models-empty"><span>◫</span><h3>No completed missions yet</h3><p>Run a single-pass reconstruction to see your textured mesh, point cloud and terrain products here.</p><button class="outline-btn" data-go="mission">Start a mission</button></div></div>
       <div class="view hidden" id="analysis-view"><section class="page-heading"><p class="kicker">MEASURE & ANALYSE</p><h2>Scene intelligence</h2><p>Accuracy and coverage tools become available after reconstruction.</p></section><div class="analysis-grid"><div class="analysis-card"><span>METRIC SCALE</span><b id="analysis-scale">—</b><small id="analysis-scale-copy">Waiting for georeferenced output</small></div><div class="analysis-card"><span>VISIBLE COVERAGE</span><b id="analysis-coverage">—</b><small id="analysis-coverage-copy">Entire visible scene</small></div><div class="analysis-card"><span>EXPORT PACKAGE</span><b>GLB · PLY</b><small>OBJ-ready mesh · ortho PNG</small></div><div class="analysis-card"><span>POINT COUNT</span><b id="analysis-points">—</b><small>Dense / sparse fused cloud</small></div><div class="analysis-card"><span>MESH FACES</span><b id="analysis-faces">—</b><small>Textured terrain surface</small></div><div class="analysis-card"><span>MEASUREMENT</span><b id="analysis-measure">Shift-click</b><small id="analysis-measure-copy">Hold Shift and click two scene points</small></div></div></div>
@@ -64,12 +64,12 @@ viewer.onProgress = (pct, loaded, total) => {
   const overlay = $('load-overlay');
   overlay.hidden = false;
   $('load-pct').textContent = `${pct}%`;
-  $('scene-state').textContent = `LOADING TERRAIN / ${pct}%`;
+  $('scene-state').textContent = `LOADING PHOTO MESH / ${pct}%`;
   $('progress-value').textContent = `${pct}%`;
   $('progress-bar').style.width = `${pct}%`;
   $('stage-label').textContent = total
-    ? `Streaming terrain ${formatBytes(loaded)} of ${formatBytes(total)}`
-    : `Streaming terrain ${formatBytes(loaded)}`;
+    ? `Streaming photo mesh ${formatBytes(loaded)} of ${formatBytes(total)}`
+    : `Streaming photo mesh ${formatBytes(loaded)}`;
 };
 viewer.onMeasure = ({ meters, message }) => {
   $('analysis-measure').textContent = meters == null ? '…' : `${meters.toFixed(2)} m`;
@@ -106,10 +106,11 @@ function setDownloads(id) {
   }
   bar.hidden = false;
   $('dl-glb').href = fileUrl(id, 'glb');
+  $('dl-terrain').href = fileUrl(id, 'terrain');
   $('dl-cloud').href = fileUrl(id, 'cloud');
   $('dl-mesh').href = fileUrl(id, 'mesh');
   $('dl-ortho').href = fileUrl(id, 'ortho');
-  ['dl-glb', 'dl-cloud', 'dl-mesh', 'dl-ortho'].forEach((key) => { $(key).download = ''; });
+  ['dl-glb', 'dl-terrain', 'dl-cloud', 'dl-mesh', 'dl-ortho'].forEach((key) => { $(key).download = ''; });
 }
 function applyMetrics(job) {
   const metrics = job?.metrics;
@@ -139,13 +140,24 @@ async function showJob(job) {
   setDownloads(job.id);
   applyMetrics(job);
   try {
-    $('scene-state').textContent = 'LOADING TERRAIN / 0%';
-    $('stage-label').textContent = 'Streaming hillshaded terrain into the viewport';
+    $('scene-state').textContent = 'LOADING PHOTO MESH / 0%';
+    $('stage-label').textContent = 'Streaming the detailed photo-coloured surface into the viewport';
     $('load-overlay').hidden = false;
-    await viewer.loadGlb(fileUrl(job.id, 'glb'));
+    const gltf = await viewer.loadGlb(fileUrl(job.id, 'glb'));
     $('load-overlay').hidden = true;
-    $('scene-state').textContent = 'TERRAIN READY / ORBIT TO INSPECT';
-    toast('Terrain loaded. Orbit to inspect relief, enable Photo points for colour, Shift-click to measure.');
+    $('scene-state').textContent = 'PHOTO-COLOURED SURFACE READY';
+    let vertices = 0;
+    let faces = 0;
+    gltf.scene.traverse((node) => {
+      if (!node.isMesh) return;
+      const positions = node.geometry.getAttribute('position');
+      if (!positions) return;
+      vertices += positions.count;
+      faces += node.geometry.index ? node.geometry.index.count / 3 : positions.count / 3;
+    });
+    const photoCoverage = job.metrics?.photoCoverage;
+    $('scene-caption').textContent = `${job.fileName || 'Scene'} · ${vertices.toLocaleString()} vertices · ${Math.round(faces).toLocaleString()} faces${photoCoverage == null ? '' : ` · ${Math.round(photoCoverage * 100)}% photo coverage`}`;
+    toast('Photo-coloured mesh loaded. Orbit to inspect detail; enable Photo points for the dense cloud overlay.');
   } catch (error) {
     toast(`Viewer could not load the mesh: ${error.message}`);
     $('load-overlay').hidden = true;
