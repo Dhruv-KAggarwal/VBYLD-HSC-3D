@@ -1,323 +1,220 @@
-# Skyforge — 3D builder from one drone video
+# Skyforge — single-pass drone video to a measurable, inspectable 3D scene
 
-Turn **one drone clip** into a georeferenced, textured 3D terrain model on this machine. No cloud photogrammetry account. The path is tuned for an **RTX 4060 8 GB** laptop: 720p frames, 4 GB GPU cache, and a browser-sized GLB instead of a 160 MB raw dump.
+Takes one drone video and produces a textured 3D mesh you can measure, a dense
+point cloud, and optionally a Gaussian splat you can fly down a street in.
 
-```
-Video → FFmpeg frames → COLMAP GPU pose
-      → dense stereo with cross-view geometric consistency
-      → gravity-aligned digital surface model → Three.js console
-```
-
-Repository: https://github.com/Dhruv-KAggarwal/3D-Builder-from-drone.git
+Everything runs locally. No cloud, no account, no upload.
 
 ---
 
 ## What you get
 
-| Product | File | What it is |
-| --- | --- | --- |
-| Viewable mesh | `terrain.glb` | Hillshaded terrain + optional photo points, loads in the console |
-| Mesh | `terrain.ply` | Same surface as PLY |
-| Point cloud | `pointcloud.ply` | Subsampled coloured cloud |
-| Orthophoto | `orthomosaic.png` | Top-down colour atlas baked from undistorted frames |
-| Metadata | `metadata.json` | Extent, scale, coverage, camera count |
+| Output | File | What it is |
+|---|---|---|
+| Textured 3D mesh | `model.glb` | Delaunay + graph-cut surface with a photographic texture atlas. The headline product. |
+| Dense point cloud | `pointcloud.ply` | What was actually measured, with no surface interpolation. |
+| Raw mesh | `mesh.ply` | Untextured geometry. |
+| Gaussian splat | `splat.ply` | Optional. Photoreal novel views — this is the one for street-level inspection. |
+| Terrain model | `terrain.glb`, `terrain.ply` | Optional. A 2.5D heightfield plus orthophoto, for elevation and ortho work. |
+| Orthophoto | `orthomosaic.png` | Optional, with the terrain model. |
+| Report | `report.json`, `report.md` | Stage timings, measured quality figures, and explicit limitations. |
 
-Products are written to `runtime/<job-id>/products/` and copied to `output/latest/`.
-
-Two design choices dominate quality:
-
-1. **Dense stereo uses geometric consistency.** Depths that neighbouring views disagree about are rejected. Without this, a single forward pass becomes a spray of points along view rays rather than a surface.
-2. **The surface is a gravity-aligned DSM, not a Poisson mesh.** Poisson wraps a watertight balloon around an open, one-sided scan. That is the wrong primitive for a drone pass.
-
-This is **terrain relief**, not a watertight BIM of every building. Towers show up as peaks; photo colour lives on the surface and in the Photo points overlay.
-
----
-
-## Who this is for
-
-Hackathon / field team on **Windows 10/11**, NVIDIA GPU, Git Bash or PowerShell. macOS/Linux can run the Node console, but the bundled engine paths are `.exe` — set `FFMPEG_PATH` / `COLMAP_PATH` to local binaries.
-
----
-
-## Repository layout
-
-```
-3D-Builder-from-drone/
-  src/                 UI (main.js, viewer.js, style.css)
-  lib/                 Reconstruction + export (COLMAP, DSM, GLB, texture)
-  tools/               Offline PNG renderer and diagnostics
-  engines/             FFmpeg + COLMAP + optional OpenMVS  ← not in git; you install these
-  runtime/<job-id>/    Scratch workspace for each run       ← gitignored
-  output/latest/       Last finished products               ← gitignored
-  server.mjs           API + static console on port 8787
-  reconstruct-cli.mjs  Command-line reconstruction
-  package.json
-```
-
-`node_modules/`, `runtime/`, `output/`, `dist/`, engine binaries, and videos are **not** committed. They are large and machine-specific.
+Products land in `runtime/<job-id>/products/` and are copied to `output/latest/`.
 
 ---
 
 ## Requirements
 
-| Need | Notes |
-| --- | --- |
-| Node.js 20+ | https://nodejs.org — includes `npm` |
-| Git for Windows | Git Bash comes with it |
-| NVIDIA GPU + recent Game Ready / Studio driver | COLMAP dense stereo is CUDA |
-| ~10 GB free disk for engines, **50+ GB** if you keep several jobs |
-| RAM | 16 GB is the design point; 4 GB is reserved for the stereo cache |
+**Hardware.** An NVIDIA GPU is effectively required: COLMAP feature extraction,
+OpenMVS depth maps and splat training are all CUDA. The reference machine is an
+RTX 4060 Laptop (8 GB), i7-14700HX (20C/28T), 16 GB RAM. 16 GB of system RAM is
+the real constraint — the texturing stage peaked at 4.1 GB on that machine and
+was paging.
 
-Confirm the GPU is visible:
-
-```bash
-nvidia-smi
-```
+**Software.** Node 22+, and Python 3.13 only if you want the Gaussian splat
+branch. The FFmpeg, COLMAP and OpenMVS binaries are not in the repository; see
+`engines/README.md` for where they go.
 
 ---
 
-## Setup (do this once per machine)
-
-### 1. Clone
-
-In **Git Bash**:
-
-```bash
-git clone https://github.com/Dhruv-KAggarwal/3D-Builder-from-drone.git
-cd 3D-Builder-from-drone
-```
-
-### 2. Install Node packages
+## Install
 
 ```bash
 npm install
 ```
 
-### 3. Install reconstruction engines
+Then put the engines in place (`engines/README.md` has the download links):
 
-Binaries are **not** in git (GitHub rejects files over 100 MB). Follow [`engines/README.md`](engines/README.md).
-
-Short version:
-
-1. FFmpeg essentials → `engines/ffmpeg/bin/ffmpeg.exe` and `ffprobe.exe`
-2. COLMAP **4.2 CUDA** → `engines/colmap/bin/colmap.exe`
-3. OpenMVS is optional and unused for the default surface
-
-Sanity check from Git Bash (from the repo root):
-
-```bash
-./engines/ffmpeg/bin/ffmpeg.exe -version
-./engines/colmap/bin/colmap.exe -h | head
+```
+engines/
+  ffmpeg/bin/ffmpeg.exe
+  ffmpeg/bin/ffprobe.exe
+  colmap/bin/colmap.exe      # must be a CUDA build
+  openmvs/                   # TextureMesh.exe, DensifyPointCloud.exe, ...
 ```
 
-COLMAP 4.2 must list `--Mapper.ba_global_frames_ratio`. If you only see `ba_global_images_ratio`, you installed 3.x and pose solving will fail.
+### Optional: learned features (recommended)
 
-### 4. Build the console
+COLMAP 4.2 can run ALIKED detection and LightGlue matching on the GPU, which is
+markedly more robust than SIFT on the repetitive facades and large flat roofs a
+drone pass is full of. It needs cuDNN 9, which the CUDA Toolkit does not ship
+(the toolkit has cuDNN 8):
 
 ```bash
-npm run build
+npm run setup:cudnn      # ~2 GB into engines/cudnn
 ```
+
+Without it the pipeline logs a warning and falls back to SIFT. It does not fail.
+
+### Optional: Gaussian splatting
+
+```bash
+npm run setup:splat      # ~3 GB: a .venv-splat with torch cu128 + gsplat
+```
+
+This uses a prebuilt gsplat wheel so no Visual Studio C++ compiler is needed.
+The official gsplat wheels compile CUDA kernels on first import and do require
+one.
 
 ---
 
-## Run the console
-
-**Git Bash or PowerShell**, from the repo root:
+## Run
 
 ```bash
-npm run api
+npm start            # builds the UI and serves it on http://localhost:8787
 ```
 
-Opens **http://localhost:8787**
-
-You should see `LOCAL ENGINE` healthy (`COLMAP + exporter online`) in the left rail. If it warns, FFmpeg or COLMAP is missing — go back to step 3.
-
-Frontend hot-reload (API must already be running in another terminal):
+For UI development with hot reload:
 
 ```bash
-npm run dev
+npm run api          # API on 8787
+npm run dev          # Vite on 5173, proxying /api to 8787
 ```
 
-Then use http://localhost:5173 — Vite proxies `/api` to port 8787.
+Then: drop a video, set the flight altitude, pick a profile, press
+**Reconstruct scene**.
 
-### Reconstruct from the UI
+### Flight altitude matters
 
-1. Drop an `.mp4` / `.mov` / `.m4v` on **Capture package** (or Browse)
-2. Pick **Rapid response** (fast, 4060-safe) or **Survey** (more frames / detail)
-3. Set **Camera altitude** in metres AGL (used for metric scale when there is no GPS)
-4. Click **Generate scene** (or `Ctrl+Enter`)
-5. Wait. A 10 s clip is ~10–15 min; a 10 min pass is aimed under 15 min on a 4060
-6. When the pipeline says **COMPLETE**, orbit the mesh. Enable **Photo points** for colour. **Shift-click** two points to measure
-7. Download **GLB / PLY cloud / PLY mesh / Ortho** from the bar under the viewport
+Consumer drone video usually carries no GPS. Without it the reconstruction has
+no absolute scale, so the altitude you type is what sets metres. Get it wrong
+and every measurement is wrong by the same ratio. The report states which
+method set the scale.
 
-Jobs also appear under **3D outputs**. **Measure & analyse** shows extent, coverage, point count, and faces.
+### Profiles
+
+| Profile | Frame width | Mesh refinement | Use for |
+|---|---|---|---|
+| Rapid | up to 1280px | no | Checking a flight is usable |
+| Balanced | up to 1920px | no | Most work |
+| Detailed | up to 2560px | yes | Final deliverable; sharpest facades |
+
+Frames are never upscaled past the source resolution. A 1080p clip on
+*Detailed* is extracted at 1920px, not 2560px — upscaling adds no detail and
+costs quadratically in the dense and texture stages.
 
 ---
 
-## Reconstruct from the CLI
+## Using the viewer
 
-Useful when you already have a path and do not want to upload through the browser.
+Three navigation modes, because orbit alone is useless at ground level:
 
-**Git Bash** (note the `--` so npm forwards the video path):
+- **Orbit** — drag to turn, scroll to zoom, right-drag to pan.
+- **Fly** — WASD to move, Q/E for down/up, mouse to look, scroll to change
+  speed, Esc to exit.
+- **Walk** — street level, camera pinned to eye height above the surface.
 
-```bash
-npm run reconstruct -- "/c/Users/<you>/Videos/flight.mp4" --altitude=82
-```
+Display modes: *authored* uses the material as exported (unlit for a baked
+atlas, which is correct — the photo already contains the scene's lighting),
+*shaded* forces lit PBR so geometric relief is visible, *flat* forces unlit for
+comparing colour against the source video.
 
-Survey / higher detail:
-
-```bash
-npm run reconstruct -- "/c/Users/<you>/Videos/flight.mp4" --studio --altitude=120
-```
-
-PowerShell:
-
-```powershell
-npm run reconstruct -- "C:\Users\<you>\Videos\flight.mp4" --altitude=82
-```
-
-Flags:
-
-| Flag | Meaning |
-| --- | --- |
-| *(default)* | Rapid (`fast`) profile |
-| `--studio` | Survey profile — more features / frames |
-| `--altitude=N` | Flight height AGL in metres (scale). Clamped 2–2000, default 82 |
-| `--reuse=runtime/<job-id>` | Rebuild GLB/PLY/ortho from an existing COLMAP job, skip stereo |
-| `--full` | With `--reuse`, finer DSM grid, lighter smoothing |
-
-Rebuild products without running stereo again:
-
-```bash
-node reconstruct-cli.mjs --reuse=runtime/<job-id> --altitude=82
-node reconstruct-cli.mjs --reuse=runtime/<job-id> --full --altitude=82
-```
-
-Replace `<job-id>` with a folder name under `runtime/` (a UUID).
+Measurement: distance, vertical height, and horizontal area. Click points in
+the scene; lines and a readout are drawn.
 
 ---
 
-## Inspect a model without the browser
+## How it works
 
-```bash
-node tools/render.mjs output/latest/terrain.ply --out=output/look.png --az=55 --el=32
-node tools/render.mjs output/latest/pointcloud.ply --out=output/cloud.png --splat=1
+```
+video
+  └─ ffmpeg (NVDEC)              extract + sharpen frames, never upscaled
+  └─ blur filter                 drop the blurriest frames
+  └─ COLMAP feature_extractor    ALIKED on GPU (SIFT fallback)
+  └─ COLMAP sequential_matcher   LightGlue + loop closure
+  └─ COLMAP global_mapper        global SfM (incremental fallback)
+  └─ COLMAP image_undistorter    pinhole dense workspace
+  └─ OpenMVS DensifyPointCloud   CUDA depth maps + fusion
+  └─ OpenMVS ReconstructMesh     Delaunay tetrahedralisation + graph-cut
+  └─ OpenMVS RefineMesh          photo-consistent vertex optimisation (Detailed)
+  └─ OpenMVS TextureMesh         per-face texture atlas
+  └─ exports                     oriented, metric GLB + cloud + report
+  └─ gsplat                      optional Gaussian splat on the same poses
 ```
 
----
-
-## How to fly so the model actually solves
-
-Photogrammetry needs **parallax**. A perfectly static hover with no camera motion cannot reconstruct 3D.
-
-- One **smooth pass** (or a slow pan), 60%+ overlap between frames
-- Locked exposure, no auto-zoom
-- 720p or higher, 24–60 fps
-- 30 seconds to 10 minutes is the sweet spot
-- Avoid empty water, glare, and textureless sky as the only content
-- Hover **plus a pan/orbit** is OK; hover locked on one point of view is not
-
-Altitude in the UI does not change geometry — it only scales the scene so measurements are in metres. If you do not know AGL, 80–120 m is a reasonable survey default; a high city pass may be 200–400 m.
+The splat branch reuses the COLMAP poses, so enabling it costs only training
+time, not a second solve.
 
 ---
 
-## Pipeline stages (what the progress bar is doing)
+## Known limitations
 
-| Stage | Engine | Typical share of time |
-| --- | --- | --- |
-| Extract frames | FFmpeg | Seconds |
-| Detect GPU features | COLMAP SIFT | Seconds |
-| Match sequential views | COLMAP | ~1 min / 80 frames |
-| Solve camera poses | COLMAP mapper | Several minutes |
-| Undistort | COLMAP | Seconds |
-| Dense stereo (2 passes) | COLMAP PatchMatch CUDA | Longest stage |
-| Fuse cloud | COLMAP | Under a minute |
-| Terrain products | Node (DSM + GLB) | Seconds |
+These are properties of single-pass capture, not bugs:
 
-Only **one** reconstruction should run at a time. Two dense jobs on one GPU thrash VRAM and can corrupt each other’s depth maps.
-
----
-
-## HTTP API (if you wire another client)
-
-Base URL: `http://localhost:8787`
-
-| Method | Path | Role |
-| --- | --- | --- |
-| `GET` | `/api/health` | FFmpeg / COLMAP / GPU status |
-| `GET` | `/api/jobs` | Completed + in-memory jobs |
-| `POST` | `/api/reconstruct` | Raw video body |
-| `GET` | `/api/reconstruct/:id` | Job status |
-| `GET` | `/api/reconstruct/:id/stream` | SSE progress |
-| `GET` | `/api/reconstruct/:id/file?kind=glb\|cloud\|mesh\|ortho\|meta` | Download a product |
-
-`POST /api/reconstruct` headers:
-
-- `Content-Type`: `video/mp4` (or the real type)
-- `X-File-Name`: original filename
-- `X-Quality`: `fast` or `studio`
-- `X-Altitude`: metres AGL (string)
-
----
-
-## Environment variables
-
-| Variable | Default |
-| --- | --- |
-| `PORT` | `8787` |
-| `FFMPEG_PATH` | `engines/ffmpeg/bin/ffmpeg.exe` |
-| `FFPROBE_PATH` | `engines/ffmpeg/bin/ffprobe.exe` |
-| `COLMAP_PATH` | `engines/colmap/bin/colmap.exe` |
-| `OPENMVS_PATH` | `engines/openmvs` |
-| `SKYFORGE_POISSON` | unset. Set to `1` to also run Poisson meshing (not used by the exporter) |
+- **A single pass sees each surface from few angles.** Facades viewed edge-on
+  and surfaces never seen at all are reconstructed from little or no evidence.
+  Faces no camera saw are filled with neutral grey, not invented detail.
+- **To get real vertical geometry, fly oblique** (camera tilted 30–45° below
+  horizontal) and ideally orbit each structure. A nadir or straight-forward
+  pass caps how much of a wall any method can recover.
+- **No GPS means no absolute georeferencing.** Output is a local tangent plane
+  in metres, scaled from your stated altitude.
+- **Moving vehicles and people** smear unless masking is enabled, and even then
+  may leave artefacts.
+- **A Gaussian splat is not a measurement.** Use the mesh and cloud for
+  distances; use the splat for looking.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Fix |
-| --- | --- |
-| `LOCAL ENGINE` warning / API offline | Run `npm run api` from the repo root, not another folder |
-| `FFmpeg was not found` / `COLMAP was not found` | Install engines as in [`engines/README.md`](engines/README.md) |
-| `unrecognised option '--Mapper.ba_global_images_ratio'` | Old code or COLMAP 3.x. This repo uses **`--Mapper.ba_global_frames_ratio`** for COLMAP 4.2 |
-| `unrecognised option '--Mapper.ba_global_frames_ratio'` | You installed COLMAP 3.x. Install 4.2 CUDA |
-| `No good initial image pair` / few cameras registered | Clip has too little motion, blur, or texture. Fly a pass with overlap |
-| Mapper succeeds, mesh is empty spray | Geometric consistency is on; if fusion is empty the exporter falls back to the sparse cloud |
-| GPU util 0% during stereo | CPU COLMAP build, or another process holds the GPU. Close other COLMAP/game/3D jobs |
-| Port already in use | `$env:PORT=8898; npm run api` (PowerShell) or `PORT=8898 npm run api` (Git Bash) |
-| Console loads but no 3D | Confirm `output/latest/terrain.glb` exists, then refresh. Check the toast for viewer errors |
-| Disk filling up | Delete old folders under `runtime/` — each job can be many GB |
-
-Keep **one** `npm run api` process. Killing the terminal should take COLMAP with it; if a `colmap.exe` is stuck, Task Manager → end task (it will otherwise starve the next job).
-
----
-
-## Hardware notes (RTX 4060 8 GB)
-
-- Stereo cache is capped at **4 GB**
-- Fusion requires **five** agreeing pixels and geometric depth maps
-- Clips longer than 45 s drop dense stereo to 960 px so a 10 min video still aims at a 15 min budget
-- Do not raise `PatchMatchStereo.cache_size` on a 16 GB laptop — it will swap
-
----
-
-## Team git workflow
-
-Do **not** commit `runtime/`, `output/`, `node_modules/`, `engines/ffmpeg`, `engines/colmap`, or videos.
+**The model renders black.** This was a real bug and is fixed; see
+`tools/validate-glb.mjs`, which checks a GLB for every cause we found:
 
 ```bash
-git checkout -b feat/my-change
-# ... edit ...
-git add -A
-git status
-git commit -m "Explain why this change exists."
-git push -u origin feat/my-change
+node tools/validate-glb.mjs output/latest/model.glb
 ```
 
-Open a pull request against `main` on GitHub.
+**Progress sits at 90% for a long time.** Texturing is the longest stage by far.
+The stage weights in `lib/reconstruct.mjs` are calibrated so this should no
+longer happen; if it does, re-measure and update `referenceSeconds`.
+
+**"cuDNN 9 not found".** Expected until you run `npm run setup:cudnn`. The
+pipeline falls back to SIFT.
+
+**Reconstruction produced no viewable model.** The dense mesh could not be
+built or textured. The log names the stage. This is deliberately a hard error:
+previously it silently shipped the 2.5D heightfield instead, which has no
+building facades and is what made the output look like a rotating photograph.
 
 ---
 
-## License
+## Tests
 
-FFmpeg: GPL/LGPL · COLMAP: BSD 3-Clause · OpenMVS: AGPL v3 · Skyforge: MIT
+```bash
+npm test             # GLB/texture regression tests + pipeline selftests
+npm run test:texture # the texture and colour-space tests alone
+```
+
+## Environment overrides
+
+| Variable | Effect |
+|---|---|
+| `SKYFORGE_FEATURES=sift` | Force SIFT instead of ALIKED + LightGlue |
+| `SKYFORGE_MAPPER=incremental` | Force the incremental mapper |
+| `SKYFORGE_NO_NVDEC=1` | Software video decode |
+| `SKYFORGE_MESH_REFINE=0/1` | Force mesh refinement off/on |
+| `SKYFORGE_DSM=1` | Always build the 2.5D terrain model |
+| `SKYFORGE_SPLAT=1` | Always train a Gaussian splat |
+| `SKYFORGE_NO_MVS=1` | Skip OpenMVS, use the COLMAP dense fallback |
+| `PORT` | API port (default 8787) |

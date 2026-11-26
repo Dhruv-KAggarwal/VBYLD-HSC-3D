@@ -2,7 +2,8 @@ import { createServer } from 'node:http';
 import { createWriteStream, createReadStream, existsSync, statSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { extname, join, resolve, normalize, relative } from 'node:path';
+import { extname, join, resolve, normalize, relative, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { rm } from 'node:fs/promises';
 import {
@@ -16,14 +17,34 @@ import {
   reconstruct,
   terminateAllEngines,
   buildStagePlan,
+  cudnnAvailable,
 } from './lib/reconstruct.mjs';
+import { detectSplat } from './lib/external.mjs';
 import { sampleTelemetry } from './lib/telemetry.mjs';
 import { hardwareFromTelemetry, hardwareLabel } from './lib/hardware.mjs';
 
 const port = Number(process.env.PORT || 8787);
-const root = resolve('runtime');
-const dist = resolve('dist');
+
+// Anchor every path to this file, not to the shell working directory. The
+// previous resolve() calls meant starting the server from anywhere but the
+// project root silently served nothing and wrote jobs into the wrong place.
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, 'runtime');
+const dist = join(here, 'dist');
+const outputLatest = join(here, 'output', 'latest');
 const jobs = new Map();
+
+/**
+ * Splat-trainer availability, probed once and cached.
+ *
+ * detectSplat shells out to Python to check for torch and gsplat, which takes
+ * seconds. Calling it inside the /api/health handler blocked the event loop
+ * for long enough that the request timed out. Probe lazily on first use, then
+ * reuse; a trainer installed while the server is running needs a restart,
+ * which is the same as every other engine here.
+ */
+let splatProbe = null;
+const splatSupport = () => (splatProbe ??= detectSplat());
 /** Open SSE sockets, closed on client disconnect and on process shutdown. */
 const liveStreams = new Set();
 
@@ -41,12 +62,18 @@ const mime = {
 
 function cors(response, type = 'application/json') {
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Name, X-Quality, X-Altitude, X-Frames, X-Threads, X-Crs');
+  // X-Crs is gone: the old UI advertised a coordinate-system picker it never
+  // sent and the server never read. Without GPS there is no CRS to pick.
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Name, X-Quality, X-Altitude, X-Frames, X-Threads, X-Splat, X-Dsm, X-Mask-Dynamic');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   response.setHeader('Content-Type', type);
 }
 
 function send(response, status, body, type = 'application/json') {
+  // Without an explicit charset the browser decodes JSON as latin-1 and any
+  // non-ASCII character (the middot in the hardware label, for one) arrives
+  // as mojibake.
+  if (type === 'application/json') type = 'application/json; charset=utf-8';
   cors(response, type);
   response.writeHead(status);
   response.end(type.startsWith('application/json') && typeof body !== 'string' && !Buffer.isBuffer(body) ? JSON.stringify(body) : body);
@@ -130,11 +157,14 @@ async function listJobs() {
 
 function fileFor(job, kind) {
   const recovered = join(root, job?.id || '', 'products');
-  const latest = resolve('output/latest');
+  const latest = outputLatest;
   const table = {
     // Prefer the full-resolution photo-coloured surface when a job has one.
     // terrain.glb is the lighter DSM and is still available as kind=terrain.
     glb: [join(recovered, 'model.glb'), job?.result?.texturedModel, job?.result?.model, join(recovered, 'terrain.glb'), join(latest, 'terrain.glb')],
+    // The Gaussian splat is optional; the viewer probes for it and quietly
+    // skips the layer when a job did not train one.
+    splat: [job?.result?.splat, join(recovered, 'splat', 'splat.ply'), join(latest, 'splat.ply')],
     terrain: [job?.result?.terrain, join(recovered, 'terrain.glb'), join(latest, 'terrain.glb')],
     full: [join(recovered, 'terrain-full.glb'), join(latest, 'terrain-full.glb'), join(recovered, 'terrain.glb')],
     cloud: [job?.result?.pointCloud, join(recovered, 'pointcloud.ply'), join(latest, 'pointcloud.ply')],
@@ -234,13 +264,20 @@ async function handle(request, response) {
       engineAvailable(commands.colmap),
       sampleTelemetry(),
     ]);
+    const splat = splatSupport();
     const running = [...jobs.values()].filter((job) => job.status === 'processing');
     return send(response, 200, {
-      gpu: process.env.CUDA_VISIBLE_DEVICES !== '-1',
+      // Report what the GPU actually is, not whether an env var happens to be
+      // unset — the old check was true on any machine with no GPU at all.
+      gpu: Boolean(telemetry?.gpu?.available),
+      gpuName: telemetry?.gpu?.name || null,
       ffmpeg,
       colmap,
       openmvs: existsSync(commands.openmvs),
-      latest: existsSync(resolve('output/latest/terrain.glb')),
+      cudnn: cudnnAvailable(),
+      splat: splat.available,
+      splatReason: splat.available ? null : splat.reason,
+      latest: existsSync(join(outputLatest, 'model.glb')) || existsSync(join(outputLatest, 'terrain.glb')),
       ready: ffmpeg && colmap,
       activeJobs: running.length,
       telemetry,
@@ -294,6 +331,12 @@ async function handle(request, response) {
       frames: normalizeFrames(request.headers['x-frames']),
       threads: request.headers['x-threads'] ? normalizeThreads(request.headers['x-threads']) : null,
       altitude: normalizeAltitude(request.headers['x-altitude']),
+      // Opt-in stages. The splat is the photoreal street-level branch and the
+      // DSM is the 2.5D heightfield; both cost real time, so neither runs
+      // unless the operator asked for it.
+      wantSplat: request.headers['x-splat'] === '1',
+      wantDsm: request.headers['x-dsm'] === '1',
+      maskDynamic: request.headers['x-mask-dynamic'] === '1',
       progress: 0,
       stage: 'Queued behind another reconstruction',
       status: 'processing',

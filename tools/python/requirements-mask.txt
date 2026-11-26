@@ -1,0 +1,5 @@
+# Minimal deps for the sky/dynamic masking heuristic (no GPU needed).
+# Install:  pip install -r tools/python/requirements-mask.txt
+numpy
+opencv-python-headless
+pillow

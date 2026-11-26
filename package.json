@@ -6,20 +6,29 @@
   "scripts": {
     "dev": "vite",
     "api": "node server.mjs",
-    "start": "node server.mjs",
+    "start": "vite build && node server.mjs",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node tools/test-texture.mjs && node tools/selftest.mjs",
+    "setup:cudnn": "python -m pip install --no-cache-dir --target engines/cudnn nvidia-cudnn-cu12",
+    "setup:splat": "python -m venv .venv-splat && .venv-splat\\Scripts\\python -m pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128 && .venv-splat\\Scripts\\python -m pip install --no-cache-dir pillow numpy packaging https://github.com/nagadomi/gsplat-windows-builds/releases/download/v20251230_6/gsplat-1.5.3+pt29cu128-cp313-cp313-win_amd64.whl",
+    "test:texture": "node tools/test-texture.mjs",
     "selftest": "node tools/selftest.mjs",
     "render": "node --max-old-space-size=4096 tools/render.mjs",
     "reconstruct": "node reconstruct-cli.mjs",
-    "export-existing": "node reconstruct-cli.mjs --reuse=runtime/0c7f4613-8279-4211-a678-f131d0875cd7 --altitude=82",
-    "export-full": "node --max-old-space-size=4096 reconstruct-cli.mjs --reuse=runtime/0c7f4613-8279-4211-a678-f131d0875cd7 --full --altitude=82"
+    "export-existing": "node reconstruct-cli.mjs",
+    "export-full": "node --max-old-space-size=4096 reconstruct-cli.mjs --full"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@vitejs/plugin-react": "^5.2.0",
+    "tailwindcss": "^4.3.5",
     "vite": "^7.1.5"
   },
   "dependencies": {
     "jpeg-js": "^0.4.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "three": "^0.186.0"
   }
 }

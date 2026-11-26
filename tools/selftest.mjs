@@ -102,7 +102,7 @@ check('nvidia-smi parser rejects junk', parseNvidiaSmi('nope') === null);
 const namedGpu = parseNvidiaSmi('NVIDIA GeForce RTX 4060 Laptop GPU, 12, 1024, 8188, 61');
 check('nvidia-smi keeps the GPU name', namedGpu?.name?.includes('RTX 4060') && namedGpu.memoryTotalMb === 8188);
 const laptop = classifyHardware({ logicalThreads: 28, ramMb: 16088, vramMb: 8188, gpuName: 'NVIDIA GeForce RTX 4060 Laptop GPU' });
-check('4060 laptop is a mid tier on 16 threads', laptop.tier === 'mid' && laptop.workerThreads === 16 && laptop.cacheGb === 4);
+check('4060 laptop is a mid tier on 24 threads', laptop.tier === 'mid' && laptop.workerThreads === 24 && laptop.cacheGb === 4);
 const cpuOnly = classifyHardware({ logicalThreads: 8, ramMb: 8192, vramMb: 0 });
 check('missing GPU falls back to the CPU tier', cpuOnly.tier === 'cpu' && cpuOnly.workerThreads <= 8);
 const rapidCanyon = qualitySettings('fast', 67.26, {}, laptop);

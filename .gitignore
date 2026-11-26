@@ -32,3 +32,20 @@ Thumbs.db
 *.local
 .env
 .env.*
+
+# cuDNN 9 runtime for COLMAP ALIKED/LightGlue (~2 GB, installed by
+# `npm run setup:cudnn`)
+engines/cudnn/
+
+# Gaussian-splat trainer virtualenv (~3 GB, installed by `npm run setup:splat`)
+.venv-splat/
+
+# Retired code kept locally for reference
+.attic/
+
+# Claude Code local settings (machine-specific paths)
+.claude/settings.local.json
+
+# Python bytecode
+__pycache__/
+*.pyc
