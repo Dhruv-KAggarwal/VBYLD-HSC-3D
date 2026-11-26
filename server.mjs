@@ -113,6 +113,9 @@ function jobPayload(job) {
     // process died", and some stages legitimately go minutes without output.
     idleMs: job.lastOutputAt ? Date.now() - job.lastOutputAt : null,
     logSeq: job.logSeq ?? 0,
+    // True once the mesh is on disk, which happens before the optional splat
+    // stage. The UI uses this to release the viewer and downloads early.
+    modelReady: Boolean(job.modelReady),
     warning: job.warning,
     error: job.error,
     result: job.result,
@@ -127,9 +130,20 @@ async function listJobs() {
   const folders = await readdir(root);
   for (const id of folders) {
     if (listed.some((job) => job.id === id)) continue;
-    const glb = join(root, id, 'products', 'terrain.glb');
-    const metaPath = join(root, id, 'products', 'metadata.json');
-    if (!existsSync(glb)) continue;
+    // Recover by the HEADLINE product, not the DSM.
+    //
+    // This looked only for terrain.glb, which was fine when the 2.5D height
+    // model was built on every run. It is now opt-in, so a perfectly good
+    // textured mesh on disk made the job invisible here: the library showed
+    // nothing and the operator was told the model "was not saved".
+    const products = join(root, id, 'products');
+    const glb = [
+      join(products, 'model.glb'),
+      join(products, 'terrain.glb'),
+    ].find((path) => existsSync(path));
+    const metaPath = join(products, 'metadata.json');
+    if (!glb) continue;
+    const pick = (...names) => names.map((name) => join(products, name)).find((path) => existsSync(path)) || null;
     let metrics = null;
     try { metrics = JSON.parse(await readFile(metaPath, 'utf8')); } catch { /* ignore */ }
     listed.push({
@@ -147,11 +161,14 @@ async function listJobs() {
       etaMs: 0,
       result: {
         model: glb,
-        pointCloud: join(root, id, 'products', 'pointcloud.ply'),
-        mesh: join(root, id, 'products', 'terrain.ply'),
-        ortho: join(root, id, 'products', 'orthomosaic.png'),
-        metadata: metaPath,
-        format: 'GLB terrain mesh + PLY point cloud',
+        texturedModel: pick('model.glb'),
+        terrain: pick('terrain.glb'),
+        pointCloud: pick('pointcloud.ply'),
+        mesh: pick('mesh.ply', 'terrain.ply'),
+        splat: pick('splat/splat.ply'),
+        ortho: pick('orthomosaic.png'),
+        metadata: existsSync(metaPath) ? metaPath : null,
+        format: glb.endsWith('model.glb') ? 'GLB textured 3D mesh + PLY cloud' : 'GLB terrain mesh + PLY point cloud',
       },
       metrics,
       fileName: metrics?.source || id,

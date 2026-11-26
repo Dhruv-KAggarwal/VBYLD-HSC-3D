@@ -221,7 +221,11 @@ export default function App() {
           pushLog('Reconstruction complete', 'ok');
           if (next.warning) pushLog(next.warning, 'warn');
           await refreshJobs();
-          await loadResult(next);
+          // Only load here if the early-release effect has not already done it.
+          if (loadedForRef.current !== next.id) {
+            loadedForRef.current = next.id;
+            await loadResult(next);
+          }
         },
         onError: (next) => {
           setJob(next);
@@ -250,6 +254,17 @@ export default function App() {
 
   useEffect(() => () => unwatchRef.current?.(), []);
 
+  // Load the model the moment the pipeline says it exists, rather than waiting
+  // for the whole job. Guarded by a ref so a re-render mid-run cannot restart
+  // a multi-megabyte download.
+  const loadedForRef = useRef(null);
+  useEffect(() => {
+    if (!modelAvailable || !job?.id) return;
+    if (loadedForRef.current === job.id) return;
+    loadedForRef.current = job.id;
+    loadResult(job);
+  }, [modelAvailable, job?.id, loadResult, job]);
+
   // Ctrl+Enter starts the run, matching the old console.
   useEffect(() => {
     const onKey = (event) => {
@@ -269,6 +284,12 @@ export default function App() {
   // Stall detection. The bar cannot tell "slow stage" from "dead process", and
   // some stages legitimately run minutes without printing (global bundle
   // adjustment, atlas packing). Warn at 2 minutes of silence, escalate at 10.
+  // A model is downloadable as soon as it is on disk, which is BEFORE the job
+  // as a whole finishes: the optional splat stage runs afterwards and can take
+  // longer than everything preceding it. Gating the downloads on
+  // status === 'complete' is what made a finished mesh look like no mesh.
+  const modelAvailable = Boolean(job && (job.modelReady || job.status === 'complete' || job.result?.model));
+
   const idleMs = job?.idleMs ?? null;
   const stall = !busy || idleMs == null ? null
     : idleMs > 600000 ? { level: 'bad', text: `No engine output for ${formatDuration(idleMs / 1000)}. The stage may be stuck — check the log below, or cancel.` }
@@ -544,7 +565,7 @@ export default function App() {
           </div>
 
           {/* downloads */}
-          {job?.status === 'complete' && (
+          {modelAvailable && (
             <div className="absolute bottom-16 right-3 panel p-1 flex flex-col gap-1 text-xs">
               {[
                 ['glb', 'Textured mesh (GLB)'],
