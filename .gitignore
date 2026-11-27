@@ -18,8 +18,11 @@ engines/*.tgz
 engines/*.tar
 engines/*.tar.gz
 
-# Footage and engine logs
+# Footage and engine logs. Input footage is never committed. The turntable
+# renders into runtime/ and output/, both already ignored above, so the only
+# MP4 that may legitimately be checked in is a small documentation sample.
 *.mp4
+!docs/*.mp4
 *.mov
 *.m4v
 *.mkv

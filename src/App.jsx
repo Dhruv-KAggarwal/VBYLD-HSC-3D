@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelViewer } from './viewer.js';
 import { cancelJob, fileUrl, getHealth, listJobs, startReconstruction, watchJob } from './api.js';
+import { TurntablePlayer } from './TurntablePlayer.jsx';
 
 const QUALITY = [
   { id: 'Rapid', title: 'Rapid', note: 'Fastest. 1280px frames, no mesh refinement.' },
@@ -57,6 +58,10 @@ export default function App() {
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // Which view the scene area shows. The turntable is a flat MP4 and needs no
+  // GPU, so it is the fallback when WebGL is unavailable as well as the
+  // quickest way to judge a finished model.
+  const [sceneView, setSceneView] = useState('viewer');
   const [log, setLog] = useState([]);
   const [loadPct, setLoadPct] = useState(null);
   const [sceneInfo, setSceneInfo] = useState(null);
@@ -258,6 +263,8 @@ export default function App() {
   // for the whole job. Guarded by a ref so a re-render mid-run cannot restart
   // a multi-megabyte download.
   const loadedForRef = useRef(null);
+  const modelAvailable = Boolean(job && (job.modelReady || job.status === 'complete' || job.result?.model));
+
   useEffect(() => {
     if (!modelAvailable || !job?.id) return;
     if (loadedForRef.current === job.id) return;
@@ -288,8 +295,6 @@ export default function App() {
   // as a whole finishes: the optional splat stage runs afterwards and can take
   // longer than everything preceding it. Gating the downloads on
   // status === 'complete' is what made a finished mesh look like no mesh.
-  const modelAvailable = Boolean(job && (job.modelReady || job.status === 'complete' || job.result?.model));
-
   const idleMs = job?.idleMs ?? null;
   const stall = !busy || idleMs == null ? null
     : idleMs > 600000 ? { level: 'bad', text: `No engine output for ${formatDuration(idleMs / 1000)}. The stage may be stuck — check the log below, or cancel.` }
@@ -498,7 +503,20 @@ export default function App() {
           <canvas ref={canvasRef} className="scene-canvas" />
 
           {/* nav + display controls */}
-          <div className="absolute top-3 left-3 flex flex-wrap gap-2 max-w-[calc(100%-1.5rem)]">
+          <div className="absolute top-3 left-3 flex flex-wrap gap-2 max-w-[calc(100%-1.5rem)] z-10">
+            <div className="panel flex p-1 gap-1" role="tablist" aria-label="Scene view">
+              {[['viewer', '3D viewer'], ['turntable', 'Turntable']].map(([id, label]) => (
+                <button
+                  key={id}
+                  role="tab"
+                  aria-selected={sceneView === id}
+                  className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent ${sceneView === id ? 'btn-toggle-on' : ''}`}
+                  onClick={() => setSceneView(id)}
+                >{label}</button>
+              ))}
+            </div>
+
+            {sceneView === 'viewer' && (
             <div className="panel flex p-1 gap-1">
               {NAV_MODES.map((mode) => (
                 <button
@@ -512,7 +530,9 @@ export default function App() {
                 >{mode.label}</button>
               ))}
             </div>
+            )}
 
+            {sceneView === 'viewer' && (
             <div className="panel flex p-1 gap-1">
               {['authored', 'shaded', 'flat'].map((mode) => (
                 <button
@@ -522,7 +542,9 @@ export default function App() {
                 >{mode}</button>
               ))}
             </div>
+            )}
 
+            {sceneView === 'viewer' && (
             <div className="panel flex p-1 gap-1">
               {MEASURE_MODES.map((mode) => (
                 <button
@@ -532,9 +554,24 @@ export default function App() {
                 >{mode.label}</button>
               ))}
             </div>
+            )}
           </div>
 
+          {/* The turntable covers the canvas rather than replacing it: the
+              viewer keeps its WebGL context and loaded model, so switching back
+              is instant and does not re-download the mesh. */}
+          {sceneView === 'turntable' && (
+            <div className="absolute inset-0 z-[5] bg-ink-950">
+              <TurntablePlayer
+                jobId={job?.id}
+                hasVideo={Boolean(job?.result?.video)}
+                onNotify={({ kind, message }) => setError(kind === 'error' ? message : null)}
+              />
+            </div>
+          )}
+
           {/* layers */}
+          {sceneView === 'viewer' && (
           <div className="absolute top-3 right-3 panel p-1 flex flex-col gap-1">
             {[
               ['mesh', 'Mesh', true],
@@ -555,6 +592,7 @@ export default function App() {
               </button>
             )}
           </div>
+          )}
 
           {/* hints + measurement readout */}
           <div className="absolute bottom-3 left-3 right-3 flex items-end justify-between gap-3 pointer-events-none">
@@ -569,6 +607,7 @@ export default function App() {
             <div className="absolute bottom-16 right-3 panel p-1 flex flex-col gap-1 text-xs">
               {[
                 ['glb', 'Textured mesh (GLB)'],
+                ['video', 'Turntable video (MP4)'],
                 ['cloud', 'Point cloud (PLY)'],
                 ['mesh', 'Raw mesh (PLY)'],
                 ['splat', 'Gaussian splat (PLY)'],

@@ -10,6 +10,48 @@ export const API = '';
 
 export const fileUrl = (id, kind) => `${API}/api/reconstruct/${id}/file?kind=${kind}`;
 
+/**
+ * Same file, with a cache-buster.
+ *
+ * Products are rewritten in place when a job is re-run or when a turntable is
+ * rendered on demand, and a <video> that has already seen a 404 or an older
+ * copy will happily keep showing it. The server sends `Cache-Control:
+ * no-store`, but the element's own in-memory copy survives a re-render, so the
+ * URL has to change for it to reload.
+ */
+export const fileUrlFresh = (id, kind, token = Date.now()) => `${fileUrl(id, kind)}&t=${token}`;
+
+/** Ask the server which outputs this job actually has on disk. */
+export async function getJobFiles(id) {
+  const response = await fetch(`${API}/api/reconstruct/${id}/files`);
+  if (!response.ok) throw new Error(`Could not list job files: ${response.status}`);
+  return response.json();
+}
+
+/** True if the file exists, without downloading it. */
+export async function hasFile(id, kind) {
+  try {
+    const response = await fetch(fileUrl(id, kind), { method: 'HEAD' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Render a turntable for a job that has none.
+ *
+ * This blocks for as long as the render takes (tens of seconds), because the
+ * server does the work synchronously — the caller wants the video, not another
+ * job to poll.
+ */
+export async function generateTurntable(id) {
+  const response = await fetch(`${API}/api/reconstruct/${id}/turntable`, { method: 'POST' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Turntable render failed: ${response.status}`);
+  return body;
+}
+
 export async function getHealth() {
   const response = await fetch(`${API}/api/health`);
   if (!response.ok) throw new Error(`Health check failed: ${response.status}`);

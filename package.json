@@ -15,6 +15,7 @@
     "test:texture": "node tools/test-texture.mjs",
     "selftest": "node tools/selftest.mjs",
     "render": "node --max-old-space-size=4096 tools/render.mjs",
+    "turntable": "node --max-old-space-size=4096 tools/turntable.mjs",
     "reconstruct": "node reconstruct-cli.mjs",
     "export-existing": "node reconstruct-cli.mjs",
     "export-full": "node --max-old-space-size=4096 reconstruct-cli.mjs --full"

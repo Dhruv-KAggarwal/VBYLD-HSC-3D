@@ -20,6 +20,7 @@ import {
   cudnnAvailable,
 } from './lib/reconstruct.mjs';
 import { detectSplat } from './lib/external.mjs';
+import { renderTurntable, turntablePath, turntableSettings } from './lib/turntable.mjs';
 import { sampleTelemetry } from './lib/telemetry.mjs';
 import { hardwareFromTelemetry, hardwareLabel } from './lib/hardware.mjs';
 
@@ -45,6 +46,13 @@ const jobs = new Map();
  */
 let splatProbe = null;
 const splatSupport = () => (splatProbe ??= detectSplat());
+/**
+ * Job ids whose turntable is being rendered right now.
+ *
+ * The render is CPU-bound and takes tens of seconds. Without this guard an
+ * impatient double-click starts two rasterisers writing the same MP4.
+ */
+const renderingTurntables = new Set();
 /** Open SSE sockets, closed on client disconnect and on process shutdown. */
 const liveStreams = new Set();
 
@@ -58,6 +66,11 @@ const mime = {
   '.glb': 'model/gltf-binary',
   '.ply': 'application/octet-stream',
   '.svg': 'image/svg+xml',
+  // The turntable. Browsers will not play an MP4 served as
+  // application/octet-stream, and they will not seek one served without
+  // byte-range support — see streamFile.
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
 };
 
 function cors(response, type = 'application/json') {
@@ -65,7 +78,9 @@ function cors(response, type = 'application/json') {
   // X-Crs is gone: the old UI advertised a coordinate-system picker it never
   // sent and the server never read. Without GPS there is no CRS to pick.
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Name, X-Quality, X-Altitude, X-Frames, X-Threads, X-Splat, X-Dsm, X-Mask-Dynamic');
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  // A cross-origin reader needs these two visible to seek a video.
+  response.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Range, Content-Length, Content-Disposition');
   response.setHeader('Content-Type', type);
 }
 
@@ -167,6 +182,10 @@ async function listJobs() {
         mesh: pick('mesh.ply', 'terrain.ply'),
         splat: pick('splat/splat.ply'),
         ortho: pick('orthomosaic.png'),
+        // Old jobs predate the turntable stage, so this is usually null and
+        // the UI offers to render one on demand.
+        video: pick('turning.mp4'),
+        poster: pick('turning.png'),
         metadata: existsSync(metaPath) ? metaPath : null,
         format: glb.endsWith('model.glb') ? 'GLB textured 3D mesh + PLY cloud' : 'GLB terrain mesh + PLY point cloud',
       },
@@ -193,21 +212,87 @@ function fileFor(job, kind) {
     mesh: [job?.result?.mesh, join(recovered, 'terrain.ply'), join(latest, 'terrain.ply')],
     ortho: [job?.result?.ortho, join(recovered, 'orthomosaic.png'), join(latest, 'orthomosaic.png')],
     meta: [job?.result?.metadata, join(recovered, 'metadata.json'), join(latest, 'metadata.json')],
+    // The 360-degree turntable MP4 and its poster still. `turning` is accepted
+    // as an alias because that is the filename, and it is what anyone reading
+    // the products directory will reach for.
+    video: [job?.result?.video, join(recovered, 'turning.mp4'), join(latest, 'turning.mp4')],
+    poster: [job?.result?.poster, join(recovered, 'turning.png'), join(latest, 'turning.png')],
   };
+  table.turning = table.video;
   return (table[kind] || table.glb).find((path) => path && existsSync(path));
 }
 
-function streamFile(response, filePath, type) {
-  cors(response, type);
+/** Every kind fileFor understands, for the downloads list and HEAD probes. */
+const FILE_KINDS = ['glb', 'splat', 'terrain', 'full', 'cloud', 'mesh', 'ortho', 'meta', 'video', 'poster'];
+
+/**
+ * Serve a file, honouring HTTP byte ranges.
+ *
+ * Range support is not an optimisation here, it is a requirement: a <video>
+ * element will not let the user seek — and Safari will not play at all —
+ * unless the server advertises `Accept-Ranges` and answers a `Range` request
+ * with 206 and the exact slice asked for. The same path serves GLBs and PLYs,
+ * which only benefits from resumable downloads.
+ */
+function streamFile(response, filePath, type, request = null) {
   const name = filePath.split(/[/\\]/).pop();
   const size = statSync(filePath).size;
-  response.setHeader('Content-Disposition', `inline; filename="${name}"`);
-  response.setHeader('Cache-Control', 'no-store');
-  response.setHeader('Content-Length', String(size));
-  const stream = createReadStream(filePath);
-  stream.on('error', (error) => {
-    if (!response.headersSent) send(response, 500, { error: error.message });
-  });
+  const rangeHeader = request?.headers?.range;
+
+  const head = (status, headers) => {
+    cors(response, type);
+    response.setHeader('Content-Disposition', `inline; filename="${name}"`);
+    response.setHeader('Accept-Ranges', 'bytes');
+    // Products are rewritten in place when a job is re-run, so a cached copy
+    // is a stale copy. The UI also cache-busts, but belt and braces.
+    response.setHeader('Cache-Control', 'no-store');
+    for (const [key, value] of Object.entries(headers)) response.setHeader(key, String(value));
+    response.writeHead(status);
+  };
+
+  // A HEAD request is how the UI asks "does this file exist and how big is
+  // it?" without pulling a 40 MB video down to find out.
+  if (request?.method === 'HEAD') {
+    head(200, { 'Content-Length': size });
+    response.end();
+    return;
+  }
+
+  let start = 0;
+  let end = size - 1;
+  if (rangeHeader) {
+    // Only the single-range form is implemented; multipart ranges are not
+    // something any browser asks a video server for.
+    const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
+    if (!match || (match[1] === '' && match[2] === '')) {
+      head(416, { 'Content-Range': `bytes */${size}` });
+      response.end();
+      return;
+    }
+    if (match[1] === '') {
+      // Suffix form: the last N bytes.
+      const length = Number(match[2]);
+      start = Math.max(0, size - length);
+    } else {
+      start = Number(match[1]);
+      if (match[2] !== '') end = Math.min(end, Number(match[2]));
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+      head(416, { 'Content-Range': `bytes */${size}` });
+      response.end();
+      return;
+    }
+    head(206, {
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Content-Length': end - start + 1,
+    });
+  } else {
+    head(200, { 'Content-Length': size });
+  }
+
+  const stream = createReadStream(filePath, { start, end });
+  stream.on('error', () => { response.destroy(); });
+  response.on('close', () => stream.destroy());
   stream.pipe(response);
 }
 
@@ -222,7 +307,7 @@ async function serveStatic(request, response) {
   }
   const info = await stat(filePath);
   if (info.isDirectory()) return send(response, 404, { error: 'Not found.' });
-  streamFile(response, filePath, mime[extname(filePath)] || 'application/octet-stream');
+  streamFile(response, filePath, mime[extname(filePath)] || 'application/octet-stream', request);
 }
 
 function writeSse(response, event, data) {
@@ -426,17 +511,83 @@ async function handle(request, response) {
     return listed ? send(response, 200, listed) : send(response, 404, { error: 'Job not found.' });
   }
 
+  // Render a turntable for a job that has not got one — an older job from
+  // before this stage existed, or one whose render failed. Synchronous on
+  // purpose: it is a bounded CPU job of tens of seconds, and the caller wants
+  // the video, not a second job to poll.
+  const videoMatch = url.pathname.match(/^\/api\/reconstruct\/([^/]+)\/turntable$/);
+  if (request.method === 'POST' && videoMatch) {
+    const id = videoMatch[1];
+    const job = jobs.get(id) || (await listJobs()).find((entry) => entry.id === id) || { id, result: null };
+    if (job.status === 'processing') {
+      return send(response, 409, { error: 'This job is still running; its turntable is rendered automatically.' });
+    }
+    const source = fileFor(job, 'glb');
+    if (!source) return send(response, 404, { error: 'No model to render a turntable from.' });
+    if (renderingTurntables.has(id)) return send(response, 409, { error: 'A turntable render is already in progress.' });
+    // A recovered job keeps its products in runtime/<id>/products; a model
+    // served out of output/latest has no job directory, so write beside it.
+    const products = join(root, id, 'products');
+    const outDir = existsSync(products) ? products : outputLatest;
+    renderingTurntables.add(id);
+    try {
+      const outcome = await renderTurntable({
+        glbPath: source,
+        outPath: turntablePath(outDir),
+        ffmpeg: commands.ffmpeg,
+        ...turntableSettings(job.metrics?.profile || 'balanced'),
+        elevation: 30,
+      });
+      if (!outcome.ok) return send(response, 500, { error: `Turntable render failed: ${outcome.reason}` });
+      if (job.result) {
+        job.result.video = outcome.path;
+        job.result.poster = outcome.posterPath;
+      }
+      return send(response, 200, {
+        id,
+        video: `/api/reconstruct/${id}/file?kind=video`,
+        frames: outcome.frames,
+        bytes: outcome.bytes,
+        durationSec: outcome.durationSec,
+        elapsedMs: outcome.elapsedMs,
+      });
+    } finally {
+      renderingTurntables.delete(id);
+    }
+  }
+
   const fileMatch = url.pathname.match(/^\/api\/reconstruct\/([^/]+)\/file$/);
-  if (request.method === 'GET' && fileMatch) {
+  if ((request.method === 'GET' || request.method === 'HEAD') && fileMatch) {
     const kind = url.searchParams.get('kind') || 'glb';
     const job = jobs.get(fileMatch[1]) || { id: fileMatch[1], result: null };
     const filePath = fileFor(job, kind);
-    if (!filePath) return send(response, 404, { error: 'Reconstruction output is not available.' });
-    streamFile(response, filePath, mime[extname(filePath)] || 'application/octet-stream');
+    if (!filePath) {
+      // A HEAD with a JSON body is a protocol violation and confuses fetch();
+      // the status alone is the answer the UI is probing for.
+      if (request.method === 'HEAD') { cors(response); response.writeHead(404); response.end(); return; }
+      return send(response, 404, { error: 'Reconstruction output is not available.' });
+    }
+    streamFile(response, filePath, mime[extname(filePath)] || 'application/octet-stream', request);
     return;
   }
 
-  if (request.method === 'GET') return serveStatic(request, response);
+  // Which outputs this job actually has, so the downloads menu can show only
+  // real files instead of a row of links that 404.
+  const filesMatch = url.pathname.match(/^\/api\/reconstruct\/([^/]+)\/files$/);
+  if (request.method === 'GET' && filesMatch) {
+    const job = jobs.get(filesMatch[1]) || (await listJobs()).find((entry) => entry.id === filesMatch[1]) || { id: filesMatch[1], result: null };
+    const available = {};
+    for (const kind of FILE_KINDS) {
+      const path = fileFor(job, kind);
+      if (!path) continue;
+      let bytes = null;
+      try { bytes = statSync(path).size; } catch { /* vanished between calls */ }
+      available[kind] = { name: path.split(/[/\\]/).pop(), bytes };
+    }
+    return send(response, 200, { id: job.id, files: available });
+  }
+
+  if (request.method === 'GET' || request.method === 'HEAD') return serveStatic(request, response);
   return send(response, 404, { error: 'Not found.' });
 }
 
