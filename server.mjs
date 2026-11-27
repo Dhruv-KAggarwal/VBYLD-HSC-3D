@@ -198,7 +198,12 @@ async function listJobs() {
 
 function fileFor(job, kind) {
   const recovered = join(root, job?.id || '', 'products');
-  const latest = outputLatest;
+  // Never let one job's download resolve to another job's file. The
+  // output/latest fallback exists for the pseudo-job that has no runtime
+  // directory at all; a real job that simply did not build a DSM or an
+  // orthophoto was being handed the previous run's copy instead, which the
+  // dashboard then presented as this reconstruction's output.
+  const latest = existsSync(recovered) ? recovered : outputLatest;
   const table = {
     // Prefer the full-resolution photo-coloured surface when a job has one.
     // terrain.glb is the lighter DSM and is still available as kind=terrain.

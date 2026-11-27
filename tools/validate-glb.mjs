@@ -161,8 +161,24 @@ function report(file) {
   for (const [index, texture] of (json.textures || []).entries()) {
     if (!json.images?.[texture.source]) problems.push(`texture[${index}] points at missing image ${texture.source}`);
   }
+  // A bufferView naming a buffer that does not exist is fatal and silent: the
+  // file opens, reports a sane size and a plausible triangle count, but every
+  // loader dies on the first read with "Cannot read properties of undefined".
+  // A GLB may hold only one binary chunk, so this is what a multi-buffer glTF
+  // turns into if its extra buffers are dropped instead of merged.
+  const bufferCount = (json.buffers || []).length;
+  for (const [index, view] of (json.bufferViews || []).entries()) {
+    const which = view.buffer ?? 0;
+    if (which >= bufferCount) {
+      problems.push(`bufferView[${index}] points at missing buffer ${which} (the file declares ${bufferCount})`);
+    }
+  }
+
+  // The GLB spec pads the BIN chunk up to a 4-byte boundary with zeros, so the
+  // chunk is legitimately up to 3 bytes longer than the buffer it carries.
+  // Only a shortfall, or a gap too big to be padding, is a real problem.
   const declared = json.buffers?.[0]?.byteLength;
-  if (declared != null && bin && declared !== bin.length) {
+  if (declared != null && bin && (declared > bin.length || bin.length - declared > 3)) {
     problems.push(`buffer declares ${declared} bytes but the BIN chunk is ${bin.length}`);
   }
 
