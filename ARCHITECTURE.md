@@ -139,7 +139,37 @@ frames the camera to the model's bounds.
 
 ---
 
-## 7. Where to start reading
+## 7. Multi-video and enhancement stages
+
+```text
+videos ─► multivideo/  sample · dedup · per-video features · intra + cross matching
+              │        connectivity ─► recovery rounds
+              ▼
+       mapper ─► merge on shared cameras ─► undistort ─► dense ─► mesh ─► texture
+              │                                                   (shared code)
+              ▼
+       products/model.glb ─► analysis ─► confidence ─► repair ─► final attribution ─► LOD
+                              (each in a worker thread; failure keeps the model)
+```
+
+| Module | Responsibility |
+|---|---|
+| `multivideo/` | Probe and validate inputs, frame selection and deduplication, VLAD retrieval, pair selection, connectivity, sub-model merging, altitude consistency, separate components. |
+| `meshdata.mjs`, `glbmesh.mjs` | One indexed mesh over all primitives with welded topology; GLB geometry read/write that preserves the alignment matrix. |
+| `spatial.mjs`, `bvh.mjs` | Hashed point grid and triangle BVH (the latter shared with the browser). |
+| `meshrepair/` | Analysis, cleanup, floating components, hole classification and filling, smoothing, appearance, provenance. |
+| `confidence/` | Visibility depth buffers, viewing angles, reprojection, point support, depth agreement, scoring, regions, exports. |
+| `lod/` | meshoptimizer simplification, atlas re-baking, error measurement, attribute transfer. |
+| `artifacts.mjs` | Content fingerprints so a derived product is never served after its source changed. |
+| `enhance/` | Job context in the mesh frame, worker thread and runner. |
+| `uploads.mjs`, `tasks.mjs`, `api.mjs` | Staged uploads, background tasks, the added routes. |
+
+Face order is the contract between these: per-face binary sidecars are indexed by
+the face order of the matching GLB.
+
+---
+
+## 8. Where to start reading
 
 1. `lib/reconstruct.mjs` → `reconstruct(job)` — the whole flow in one function.
 2. `lib/openmvs.mjs` → `buildTexturedMesh` — the four-tool textured-mesh chain.

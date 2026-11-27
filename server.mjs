@@ -23,6 +23,11 @@ import { detectSplat } from './lib/external.mjs';
 import { renderTurntable, turntablePath, turntableSettings } from './lib/turntable.mjs';
 import { sampleTelemetry } from './lib/telemetry.mjs';
 import { hardwareFromTelemetry, hardwareLabel } from './lib/hardware.mjs';
+import { createApi, isSafeId, normalizeEnhance, readBody } from './lib/api.mjs';
+import { createUploadStore } from './lib/uploads.mjs';
+import { createTaskManager } from './lib/tasks.mjs';
+import { jobViews } from './lib/views.mjs';
+import { readJson, writeJson } from './lib/multivideo/manifest.mjs';
 
 const port = Number(process.env.PORT || 8787);
 
@@ -30,10 +35,12 @@ const port = Number(process.env.PORT || 8787);
 // previous resolve() calls meant starting the server from anywhere but the
 // project root silently served nothing and wrote jobs into the wrong place.
 const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, 'runtime');
+const root = process.env.SKYFORGE_RUNTIME ? resolve(process.env.SKYFORGE_RUNTIME) : join(here, 'runtime');
 const dist = join(here, 'dist');
 const outputLatest = join(here, 'output', 'latest');
 const jobs = new Map();
+const uploads = createUploadStore({ root, commands });
+const tasks = createTaskManager();
 
 /**
  * Splat-trainer availability, probed once and cached.
@@ -71,14 +78,17 @@ const mime = {
   // byte-range support — see streamFile.
   '.mp4': 'video/mp4',
   '.webm': 'video/webm',
+  '.md': 'text/markdown; charset=utf-8',
+  '.bin': 'application/octet-stream',
+  '.wasm': 'application/wasm',
 };
 
 function cors(response, type = 'application/json') {
   response.setHeader('Access-Control-Allow-Origin', '*');
   // X-Crs is gone: the old UI advertised a coordinate-system picker it never
   // sent and the server never read. Without GPS there is no CRS to pick.
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Name, X-Quality, X-Altitude, X-Frames, X-Threads, X-Splat, X-Dsm, X-Mask-Dynamic');
-  response.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Name, X-Quality, X-Altitude, X-Frames, X-Threads, X-Splat, X-Dsm, X-Mask-Dynamic, X-Enhance');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, DELETE, OPTIONS');
   // A cross-origin reader needs these two visible to seek a video.
   response.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Range, Content-Length, Content-Disposition');
   response.setHeader('Content-Type', type);
@@ -136,7 +146,46 @@ function jobPayload(job) {
     result: job.result,
     metrics: job.metrics,
     fileName: job.fileName,
+    mode: job.mode || 'single',
+    videoCount: job.videoCount ?? null,
   };
+}
+
+/** What survives a restart about a job, beside its products. */
+async function saveJobRecord(job) {
+  await writeJson(join(job.work, 'job.json'), {
+    id: job.id,
+    mode: job.mode || 'single',
+    fileName: job.fileName,
+    videoCount: job.videoCount ?? 1,
+    createdAt: job.createdAt,
+    finishedAt: job.status === 'processing' ? null : new Date().toISOString(),
+    status: job.status,
+    quality: job.quality,
+    altitude: job.altitude,
+    maxFrames: job.maxFrames ?? job.frames ?? null,
+    matching: job.matching || null,
+    splat: Boolean(job.wantSplat),
+    dsm: Boolean(job.wantDsm),
+    maskDynamic: Boolean(job.maskDynamic),
+    enhance: job.enhance || null,
+    warning: job.warning || null,
+    error: job.error || null,
+  }).catch(() => {});
+}
+
+function startJob(job) {
+  job.createdAt = new Date().toISOString();
+  jobs.set(job.id, job);
+  saveJobRecord(job);
+  queueExclusive(() => reconstruct(job))
+    .then(() => { job.status = 'complete'; })
+    .catch((error) => {
+      job.status = 'error';
+      job.error = error.message;
+      job.peaks?.stop();
+    })
+    .finally(() => saveJobRecord(job));
 }
 
 async function listJobs() {
@@ -161,6 +210,7 @@ async function listJobs() {
     const pick = (...names) => names.map((name) => join(products, name)).find((path) => existsSync(path)) || null;
     let metrics = null;
     try { metrics = JSON.parse(await readFile(metaPath, 'utf8')); } catch { /* ignore */ }
+    const record = await readJson(join(root, id, 'job.json'));
     listed.push({
       id,
       status: 'complete',
@@ -190,7 +240,10 @@ async function listJobs() {
         format: glb.endsWith('model.glb') ? 'GLB textured 3D mesh + PLY cloud' : 'GLB terrain mesh + PLY point cloud',
       },
       metrics,
-      fileName: metrics?.source || id,
+      fileName: record?.fileName || metrics?.source || id,
+      mode: record?.mode || 'single',
+      videoCount: record?.videoCount ?? null,
+      warning: record?.warning || undefined,
     });
   }
   return listed.sort((a, b) => String(b.metrics?.generatedAt || '').localeCompare(String(a.metrics?.generatedAt || '')));
@@ -222,13 +275,25 @@ function fileFor(job, kind) {
     // the products directory will reach for.
     video: [job?.result?.video, join(recovered, 'turning.mp4'), join(latest, 'turning.mp4')],
     poster: [job?.result?.poster, join(recovered, 'turning.png'), join(latest, 'turning.png')],
+    report: [join(recovered, 'report.md')],
+    // Enhancement products belong to one job; none of them falls back.
+    original: [join(recovered, 'model.glb')],
+    repaired: [join(recovered, 'model-repaired.glb')],
+    removed: [join(recovered, 'repair', 'removed.glb')],
+    'repair-report': [join(recovered, 'repair', 'repair-report.json')],
+    'confidence-glb': [join(recovered, 'confidence', 'confidence.glb')],
+    'confidence-ply': [join(recovered, 'confidence', 'confidence.ply')],
+    'confidence-bin': [join(recovered, 'confidence', 'confidence.bin')],
+    'confidence-report': [join(recovered, 'confidence', 'confidence-report.md')],
+    'lod-report': [join(recovered, 'reports', 'lod-report.json')],
   };
   table.turning = table.video;
   return (table[kind] || table.glb).find((path) => path && existsSync(path));
 }
 
 /** Every kind fileFor understands, for the downloads list and HEAD probes. */
-const FILE_KINDS = ['glb', 'splat', 'terrain', 'full', 'cloud', 'mesh', 'ortho', 'meta', 'video', 'poster'];
+const FILE_KINDS = ['glb', 'splat', 'terrain', 'full', 'cloud', 'mesh', 'ortho', 'meta', 'video', 'poster',
+  'report', 'original', 'repaired', 'removed', 'repair-report', 'confidence-glb', 'confidence-ply', 'confidence-bin', 'confidence-report', 'lod-report'];
 
 /**
  * Serve a file, honouring HTTP byte ranges.
@@ -382,9 +447,67 @@ async function openJobStream(id, request, response) {
   await pump().catch(() => close());
 }
 
+/** `X-Enhance` carries URI-encoded JSON, same shape as the multi-video options. */
+function enhanceFromHeader(value) {
+  if (!value) return normalizeEnhance();
+  try { return normalizeEnhance(JSON.parse(decodeURIComponent(String(value)))); } catch { return normalizeEnhance(); }
+}
+
+/** Progress of the enhancement task running against a job. */
+async function openTaskStream(id, request, response) {
+  cors(response, 'text/event-stream; charset=utf-8');
+  response.writeHead(200, {
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.flushHeaders?.();
+  const client = { response, id };
+  liveStreams.add(client);
+  let closed = false;
+  let timer = null;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    liveStreams.delete(client);
+    try { response.end(); } catch { /* already gone */ }
+  };
+  request.on('close', close);
+  const pump = () => {
+    if (closed) return;
+    const task = tasks.get(id);
+    if (!task) {
+      writeSse(response, 'done', { task: null });
+      close();
+      return;
+    }
+    const finished = task.status !== 'queued' && task.status !== 'running';
+    writeSse(response, finished ? 'done' : 'progress', { task });
+    if (finished) close();
+  };
+  timer = setInterval(pump, 750);
+  pump();
+}
+
+const api = createApi({
+  root,
+  uploads,
+  tasks,
+  jobs,
+  send,
+  streamFile,
+  commands,
+  openTaskStream,
+  hardware: async () => hardwareFromTelemetry(await sampleTelemetry()),
+});
+
 async function handle(request, response) {
   if (request.method === 'OPTIONS') return send(response, 204, '');
   const url = new URL(request.url, `http://localhost:${port}`);
+  const idMatch = url.pathname.match(/^\/api\/reconstruct\/([^/]+)/);
+  if (idMatch && !isSafeId(idMatch[1])) return send(response, 400, { error: 'Invalid job id.' });
+  if (url.pathname.startsWith('/api/') && await api(request, response, url)) return undefined;
 
   if (request.method === 'GET' && url.pathname === '/api/health') {
     const [ffmpeg, colmap, telemetry] = await Promise.all([
@@ -411,6 +534,7 @@ async function handle(request, response) {
       telemetry,
       hardware: hardwareFromTelemetry(telemetry),
       hardwareLabel: hardwareLabel(hardwareFromTelemetry(telemetry)),
+      uploadLimits: uploads.limits(),
     });
   }
 
@@ -420,6 +544,53 @@ async function handle(request, response) {
 
   if (request.method === 'GET' && url.pathname === '/api/jobs') {
     return send(response, 200, await listJobs());
+  }
+
+  // Multi-video: the videos are already staged, so the body is JSON options.
+  if (request.method === 'POST' && url.pathname === '/api/reconstruct'
+    && String(request.headers['content-type'] || '').startsWith('application/json')) {
+    for (const [name, binary] of [['FFmpeg', commands.ffmpeg], ['COLMAP', commands.colmap]]) {
+      if (!existsSync(binary)) return send(response, 503, { error: `${name} is not installed at ${binary}.` });
+    }
+    const body = await readBody(request);
+    const options = body.options || {};
+    if (typeof body.uploadId !== 'string') return send(response, 400, { error: 'uploadId is required.' });
+    const id = randomUUID();
+    const work = join(root, id);
+    let session;
+    try {
+      await mkdir(work, { recursive: true });
+      session = await uploads.claim(body.uploadId, work);
+    } catch (error) {
+      await rm(work, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+    const enabled = session.videos.filter((v) => v.settings.enabled);
+    const maxFrames = Number(options.frames);
+    const job = {
+      id,
+      work,
+      mode: 'multi',
+      videoCount: enabled.length,
+      fileName: enabled.length === 1 ? enabled[0].originalName : `${enabled.length} videos: ${enabled[0].originalName} …`,
+      quality: normalizeQuality(options.quality),
+      maxFrames: Number.isFinite(maxFrames) && maxFrames > 0 ? Math.min(2000, Math.max(24, Math.round(maxFrames))) : null,
+      frames: null,
+      threads: options.threads ? normalizeThreads(options.threads) : null,
+      altitude: normalizeAltitude(options.altitude),
+      matching: options.matching === 'exhaustive' ? 'exhaustive' : 'auto',
+      separateComponents: options.separateComponents !== false,
+      wantSplat: options.splat === true,
+      wantDsm: options.dsm === true,
+      maskDynamic: options.maskDynamic === true,
+      enhance: normalizeEnhance(options.enhance),
+      progress: 0,
+      stage: 'Queued behind another reconstruction',
+      status: 'processing',
+      cancelHooks: new Set(),
+    };
+    startJob(job);
+    return send(response, 202, { id });
   }
 
   if (request.method === 'POST' && url.pathname === '/api/reconstruct') {
@@ -465,18 +636,15 @@ async function handle(request, response) {
       wantSplat: request.headers['x-splat'] === '1',
       wantDsm: request.headers['x-dsm'] === '1',
       maskDynamic: request.headers['x-mask-dynamic'] === '1',
+      // Optional and absent by default, so existing clients run exactly the
+      // pipeline they always did.
+      enhance: enhanceFromHeader(request.headers['x-enhance']),
       progress: 0,
       stage: 'Queued behind another reconstruction',
       status: 'processing',
       cancelHooks: new Set(),
     };
-    jobs.set(id, job);
-    queueExclusive(() => reconstruct(job))
-      .then(() => { job.status = 'complete'; })
-      .catch((error) => {
-        job.status = 'error';
-        job.error = error.message;
-      });
+    startJob(job);
     return send(response, 202, { id });
   }
 
@@ -536,7 +704,9 @@ async function handle(request, response) {
     const outDir = existsSync(products) ? products : outputLatest;
     renderingTurntables.add(id);
     try {
+      const filmed = existsSync(products) ? await jobViews(join(root, id)).catch(() => null) : null;
       const outcome = await renderTurntable({
+        focus: filmed?.focus,
         glbPath: source,
         outPath: turntablePath(outDir),
         ffmpeg: commands.ffmpeg,
@@ -597,7 +767,14 @@ async function handle(request, response) {
 }
 
 await mkdir(root, { recursive: true });
-const server = createServer((request, response) => handle(request, response).catch((error) => send(response, 500, { error: error.message })));
+await uploads.cleanupStale().catch(() => {});
+setInterval(() => { uploads.cleanupStale().catch(() => {}); }, 3600 * 1000).unref();
+const server = createServer((request, response) => handle(request, response).catch((error) => {
+  if (response.headersSent) { response.destroy(); return; }
+  send(response, error.status || 500, { error: error.message });
+}));
+// Multi-gigabyte uploads legitimately take longer than Node's default.
+server.requestTimeout = 0;
 server.on('error', (error) => {
   if (error.code === 'EADDRINUSE') {
     console.error(`Skyforge API is already running on http://localhost:${port}.`);
@@ -620,6 +797,12 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\nStopping engines and shutting down (${signal})...`);
+    tasks.cancelAll();
+    for (const job of jobs.values()) {
+      if (job.status !== 'processing') continue;
+      job.cancelled = true;
+      for (const hook of job.cancelHooks || []) hook();
+    }
     terminateAllEngines();
     for (const client of liveStreams) {
       try { client.response.end(); } catch { /* already closed */ }

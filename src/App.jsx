@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelViewer } from './viewer.js';
-import { cancelJob, fileUrl, getHealth, listJobs, startReconstruction, watchJob } from './api.js';
+import {
+  cancelJob, fileUrl, fileUrlFresh, getArtifacts, getHealth, getJobFiles, getLodManifest, getViews, listJobs, lodUrl,
+  startMultiReconstruction, startReconstruction, watchJob,
+} from './api.js';
 import { TurntablePlayer } from './TurntablePlayer.jsx';
+import { MultiVideoUpload } from './components/MultiVideoUpload.jsx';
+import { DRAWER_TABS, EnhancementDrawer } from './components/EnhancementDrawer.jsx';
+import { REPAIR_DEFAULTS, RepairSettings } from './components/MeshRepairPanel.jsx';
+import { DroneViews } from './components/DroneViews.jsx';
+import { Collapsible, Segmented, Toggle, formatBytes, formatDuration } from './components/ui.jsx';
 
 const QUALITY = [
   { id: 'Rapid', title: 'Rapid', note: 'Fastest. 1280px frames, no mesh refinement.' },
   { id: 'Balanced', title: 'Balanced', note: '1920px frames, full texture atlas.' },
-  { id: 'Detailed', title: 'Detailed', note: 'Adds photo-consistent mesh refinement for crisp facades.' },
+  { id: 'Detailed', title: 'Detailed', note: 'Most building detail: up to 1.8M triangles and an 8192px texture. Much slower.' },
 ];
 
 const NAV_MODES = [
@@ -22,15 +30,6 @@ const MEASURE_MODES = [
   { id: 'area', label: 'Area' },
 ];
 
-function formatBytes(bytes) {
-  if (!bytes) return '—';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let index = 0;
-  let value = bytes;
-  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
-  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
 function clockOf(at) {
   if (!at) return '--:--:--';
   const d = new Date(at);
@@ -38,12 +37,22 @@ function clockOf(at) {
     .map((n) => String(n).padStart(2, '0')).join(':');
 }
 
-function formatDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return '—';
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return m ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`;
-}
+const DOWNLOADS = [
+  ['glb', 'Textured mesh (GLB)'],
+  ['repaired', 'Repaired mesh (GLB)'],
+  ['video', 'Turntable video (MP4)'],
+  ['cloud', 'Point cloud (PLY)'],
+  ['mesh', 'Raw mesh (PLY)'],
+  ['splat', 'Gaussian splat (PLY)'],
+  ['terrain', 'Terrain DSM (GLB)'],
+  ['ortho', 'Orthophoto (PNG)'],
+  ['meta', 'Metadata (JSON)'],
+  ['report', 'Report (Markdown)'],
+  ['confidence-glb', 'Confidence heatmap (GLB)'],
+  ['confidence-ply', 'Confidence (PLY)'],
+  ['confidence-report', 'Confidence report'],
+  ['lod-report', 'LOD report'],
+];
 
 export default function App() {
   const canvasRef = useRef(null);
@@ -54,6 +63,16 @@ export default function App() {
   const [health, setHealth] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [file, setFile] = useState(null);
+  const [inputMode, setInputMode] = useState('single');
+  const [session, setSession] = useState(null);
+  const [pendingUploads, setPendingUploads] = useState(0);
+  const [drawer, setDrawer] = useState(null);
+  const [lod, setLod] = useState(null);
+  const [modelVersion, setModelVersion] = useState(0);
+  const [viewer, setViewer] = useState(null);
+  const [downloads, setDownloads] = useState(null);
+  const [views, setViews] = useState(null);
+  const loadSequence = useRef(0);
   const [dragging, setDragging] = useState(false);
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -80,6 +99,13 @@ export default function App() {
     splat: false,
     dsm: false,
     maskDynamic: false,
+    matching: 'auto',
+    separateComponents: true,
+    // Optional stages. Repair is opt-in; the original model is kept either way.
+    confidence: true,
+    lod: true,
+    repair: false,
+    repairSettings: { ...REPAIR_DEFAULTS },
   });
 
   const [display, setDisplay] = useState({
@@ -98,6 +124,9 @@ export default function App() {
     if (!canvasRef.current || viewerRef.current) return;
     const viewer = new ModelViewer(canvasRef.current);
     viewerRef.current = viewer;
+    setViewer(viewer);
+    viewer.onLodState = setLod;
+    viewer.onModelShown = () => setModelVersion((v) => v + 1);
     viewer.onProgress = (pct, loaded, total) => {
       setLoadPct({ pct: Math.round(pct * 100), loaded, total });
     };
@@ -141,22 +170,68 @@ export default function App() {
   }, [refreshJobs]);
 
   // --- Loading results into the viewer -------------------------------------
-  const loadResult = useCallback(async (target) => {
+  const loadResult = useCallback(async (target, { keepCamera = false } = {}) => {
     const viewer = viewerRef.current;
     if (!viewer || !target?.id) return;
+    const sequence = ++loadSequence.current;
+    const current = () => sequence === loadSequence.current;
+    const camera = keepCamera ? viewer.cameraState() : null;
     setLoadPct({ pct: 0, loaded: 0, total: 0 });
     try {
-      viewer.clearModel();
-      const { hasTexture, hasVertexColor } = await viewer.loadGlb(fileUrl(target.id, 'glb'));
+      viewer.clearModel({ keepMeasure: keepCamera });
+      if (!keepCamera) { viewer.setViews(null); setViews(null); }
+      viewer.scaleReliable = target.metrics
+        ? (target.metrics.scaleReliable ?? target.metrics.scaleSource === 'flight-altitude')
+        : true;
+      // Older jobs, and jobs still running, may have no derived products at all.
+      const artifacts = await getArtifacts(target.id).catch(() => null);
+      let hasTexture = false;
+      let hasVertexColor = false;
+      let levels = false;
+      if (artifacts?.artifacts.lod.current) {
+        try {
+          const manifest = await getLodManifest(target.id);
+          if (!current()) return;
+          await viewer.openLod(manifest, (level) => lodUrl(target.id, level.level, manifest.generatedAt));
+          // A newer load owns the viewer now; leave its session alone.
+          if (!current()) return;
+          levels = viewer.lod?.current != null;
+          hasTexture = manifest.levels[0].textureCount > 0;
+          hasVertexColor = !hasTexture;
+          if (levels) pushLog(`Loaded progressively: ${manifest.levels.length} levels of detail`, 'ok');
+          else viewer.closeLod();
+        } catch (lodError) {
+          if (!current()) return;
+          viewer.closeLod();
+          pushLog(`Levels of detail unavailable (${lodError.message}); loading the full model`, 'warn');
+        }
+      }
+      if (!levels) {
+        const url = artifacts?.activeModel === 'repaired'
+          ? fileUrlFresh(target.id, 'repaired', artifacts.artifacts.repair.createdAt)
+          : fileUrlFresh(target.id, 'glb', artifacts?.artifacts.repair.createdAt || target.id);
+        const loaded = await viewer.loadModelData(url, { quiet: false });
+        if (!current()) { viewer.disposeObject(loaded.model); return; }
+        viewer.showModel(loaded.model, { fit: true });
+        ({ hasTexture, hasVertexColor } = loaded);
+        pushLog(hasTexture
+          ? 'Loaded textured 3D mesh (photographic atlas)'
+          : 'Loaded vertex-coloured 3D mesh (no texture atlas in this build)', 'ok');
+      }
+      if (!current()) return;
+      if (camera) viewer.restoreCamera(camera);
+      // Open from where the drone actually looked, on the area it filmed.
+      const found = await getViews(target.id).catch(() => null);
+      if (!current()) return;
+      setViews(found ? { id: target.id, ...found } : null);
+      viewer.setViews(found, { jump: !keepCamera });
+      if (found && !keepCamera) viewer.setFocusClip(true);
       const info = {
         textured: hasTexture,
         vertexColoured: hasVertexColor && !hasTexture,
         splat: false,
         cloud: false,
       };
-      pushLog(hasTexture
-        ? 'Loaded textured 3D mesh (photographic atlas)'
-        : 'Loaded vertex-coloured 3D mesh (no texture atlas in this build)', 'ok');
 
       // The splat is optional and may not exist for this job.
       try {
@@ -165,12 +240,13 @@ export default function App() {
         pushLog(`Loaded Gaussian splat (${splat.count.toLocaleString()} splats)`, 'ok');
       } catch { /* no splat for this job */ }
 
-      setSceneInfo(info);
+      if (current()) setSceneInfo(info);
     } catch (loadError) {
+      if (!current()) return;
       pushLog(`Could not load the model: ${loadError.message}`, 'error');
       setError(`Could not load the model: ${loadError.message}`);
     } finally {
-      setLoadPct(null);
+      if (current()) setLoadPct(null);
     }
   }, [pushLog]);
 
@@ -192,15 +268,30 @@ export default function App() {
   }, [job?.id, pushLog]);
 
   // --- Running a job -------------------------------------------------------
+  const enabledVideos = session?.videos?.filter((v) => v.settings.enabled).length || 0;
+  const multi = inputMode === 'multi';
+  const canStart = multi ? enabledVideos > 0 && pendingUploads === 0 : Boolean(file);
+
   const start = useCallback(async () => {
-    if (!file || busy) return;
+    if (!canStart || busy) return;
     setBusy(true);
     setError(null);
     setLog([]);
     setSceneInfo(null);
-    pushLog(`Uploading ${file.name} (${formatBytes(file.size)})`);
+    pushLog(multi ? `Starting a reconstruction from ${enabledVideos} videos` : `Uploading ${file.name} (${formatBytes(file.size)})`);
     try {
-      const { id } = await startReconstruction(file, options);
+      const enhance = {
+        analysis: options.repair || options.confidence || options.lod,
+        confidence: options.confidence,
+        lod: options.lod,
+        repair: options.repair,
+        repairSettings: options.repairSettings,
+      };
+      const { id } = multi
+        ? await startMultiReconstruction(session.id, { ...options, enhance })
+        : await startReconstruction(file, { ...options, enhance });
+      if (multi) setSession(null);
+      loadedForRef.current = null;
       pushLog(`Job ${id} accepted; reconstruction queued`, 'ok');
       unwatchRef.current?.();
       unwatchRef.current = watchJob(id, {
@@ -227,9 +318,13 @@ export default function App() {
           if (next.warning) pushLog(next.warning, 'warn');
           await refreshJobs();
           // Only load here if the early-release effect has not already done it.
-          if (loadedForRef.current !== next.id) {
+          // Repair and LOD finish after the early release, so load again for them.
+          const derived = await getArtifacts(next.id).catch(() => null);
+          const changed = derived?.artifacts.lod.current || derived?.activeModel === 'repaired';
+          if (loadedForRef.current !== next.id || changed) {
+            const again = loadedForRef.current === next.id;
             loadedForRef.current = next.id;
-            await loadResult(next);
+            await loadResult(next, { keepCamera: again });
           }
         },
         onError: (next) => {
@@ -245,7 +340,7 @@ export default function App() {
       setError(startError.message);
       pushLog(startError.message, 'error');
     }
-  }, [file, busy, options, pushLog, refreshJobs, loadResult]);
+  }, [canStart, multi, enabledVideos, session, file, busy, options, pushLog, refreshJobs, loadResult]);
 
   const stop = useCallback(async () => {
     if (!job?.id) return;
@@ -280,6 +375,18 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [start]);
+
+  // Offer only the outputs that exist on disk.
+  useEffect(() => {
+    let stale = false;
+    if (!modelAvailable || !job?.id) { setDownloads(null); return undefined; }
+    getJobFiles(job.id).then((r) => { if (!stale) setDownloads(r.files); }).catch(() => { if (!stale) setDownloads(null); });
+    return () => { stale = true; };
+  }, [job?.id, job?.status, modelAvailable, modelVersion]);
+
+  const reloadCurrent = useCallback(() => {
+    if (job?.id) loadResult(job, { keepCamera: true });
+  }, [job, loadResult]);
 
   const stages = job?.stages || [];
   // job.progress and stage.progress are ALREADY percentages (the tracker emits
@@ -321,14 +428,14 @@ export default function App() {
   }, [health]);
 
   return (
-    <div className="h-full grid grid-cols-[380px_1fr] bg-ink-950">
+    <div className="h-full grid grid-cols-[380px_minmax(0,1fr)] grid-rows-1 max-md:grid-cols-1 max-md:grid-rows-none max-md:overflow-y-auto bg-ink-950">
       {/* ------------------------------------------------- control column */}
-      <aside className="h-full overflow-y-auto border-r border-ink-700 bg-ink-900 flex flex-col">
+      <aside className="h-full min-h-0 max-md:h-auto overflow-y-auto border-r border-ink-700 bg-ink-900 flex flex-col">
         <header className="px-5 py-4 border-b border-ink-700 flex items-center gap-3 sticky top-0 bg-ink-900 z-10">
           <div className="w-9 h-9 rounded-lg bg-jet-500/15 border border-jet-500/40 grid place-items-center text-jet-400 text-lg">◈</div>
           <div className="min-w-0">
             <div className="font-semibold tracking-wide text-mist-200">SKYFORGE</div>
-            <div className="kicker truncate">Single-pass drone → 3D</div>
+            <div className="kicker truncate">Drone video → 3D</div>
           </div>
         </header>
 
@@ -336,6 +443,20 @@ export default function App() {
           {/* ---- 1. footage */}
           <section>
             <p className="kicker mb-2">01 · Footage</p>
+            <div className="mb-2">
+              <Segmented
+                label="Input mode" disabled={busy} value={inputMode} onChange={setInputMode}
+                options={[['single', 'Single video'], ['multi', 'Multi-video']]}
+              />
+            </div>
+            {multi && (
+              <MultiVideoUpload
+                session={session} onSession={setSession} onPending={setPendingUploads} disabled={busy}
+                quality={{ Rapid: 'fast', Balanced: 'balanced', Detailed: 'detailed' }[options.quality]}
+                frames={options.frames}
+              />
+            )}
+            {!multi && (
             <div
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
               onDragLeave={() => setDragging(false)}
@@ -368,6 +489,7 @@ export default function App() {
                 </>
               )}
             </div>
+            )}
           </section>
 
           {/* ---- 2. profile */}
@@ -393,7 +515,7 @@ export default function App() {
             <p className="kicker">03 · Parameters</p>
 
             <label className="block">
-              <span className="kicker block mb-1">Flight altitude above ground (m)</span>
+              <span className="kicker block mb-1">Flight altitude above ground (m){multi ? ' — default for all videos' : ''}</span>
               <input
                 type="number" min="1" max="2000" className="field" disabled={busy}
                 value={options.altitude}
@@ -406,9 +528,9 @@ export default function App() {
 
             <div className="grid grid-cols-2 gap-2">
               <label className="block">
-                <span className="kicker block mb-1">Frames</span>
+                <span className="kicker block mb-1">{multi ? 'Total frames' : 'Frames'}</span>
                 <input
-                  type="number" min="12" max="240" placeholder="Auto" className="field" disabled={busy}
+                  type="number" min={multi ? 24 : 12} max={multi ? 2000 : 240} placeholder="Auto" className="field" disabled={busy}
                   value={options.frames}
                   onChange={(e) => setOptions((o) => ({ ...o, frames: e.target.value }))}
                 />
@@ -447,7 +569,50 @@ export default function App() {
                 label="Mask moving vehicles and people"
                 note="Stops traffic smearing into the geometry. Slower."
               />
+              {multi && (
+                <>
+                  <Toggle
+                    checked={options.matching === 'exhaustive'}
+                    disabled={busy}
+                    onChange={(v) => setOptions((o) => ({ ...o, matching: v ? 'exhaustive' : 'auto' }))}
+                    label="Exhaustive matching"
+                    note="Compares every frame with every other. Much slower; off uses retrieval-ranked pairs."
+                  />
+                  <Toggle
+                    checked={options.separateComponents}
+                    disabled={busy}
+                    onChange={(v) => setOptions((o) => ({ ...o, separateComponents: v }))}
+                    label="Model unconnected groups separately"
+                    note="Videos that cannot be merged get their own model instead of being forced in."
+                  />
+                </>
+              )}
             </div>
+          </section>
+
+          {/* ---- 4. enhancements */}
+          <section className="space-y-2">
+            <p className="kicker">04 · After reconstruction</p>
+            <Toggle
+              checked={options.confidence} disabled={busy}
+              onChange={(v) => setOptions((o) => ({ ...o, confidence: v }))}
+              label="Confidence analysis" note="Heatmap of how well each surface is supported by the footage."
+            />
+            <Toggle
+              checked={options.lod} disabled={busy}
+              onChange={(v) => setOptions((o) => ({ ...o, lod: v }))}
+              label="Levels of detail" note="Lighter models for faster loading and navigation."
+            />
+            <Toggle
+              checked={options.repair} disabled={busy}
+              onChange={(v) => setOptions((o) => ({ ...o, repair: v }))}
+              label="Automatic mesh repair" note="Writes a repaired copy; the original is always kept."
+            />
+            {options.repair && (
+              <Collapsible title="Repair settings">
+                <RepairSettings value={options.repairSettings} disabled={busy} onChange={(repairSettings) => setOptions((o) => ({ ...o, repairSettings }))} />
+              </Collapsible>
+            )}
           </section>
 
           {/* ---- run */}
@@ -455,7 +620,7 @@ export default function App() {
             {busy ? (
               <button className="btn btn-danger w-full" onClick={stop}>Cancel reconstruction</button>
             ) : (
-              <button className="btn btn-primary w-full" onClick={start} disabled={!file}>
+              <button className="btn btn-primary w-full" onClick={start} disabled={!canStart}>
                 ◈ Reconstruct scene
                 <kbd className="kicker opacity-70">Ctrl ↵</kbd>
               </button>
@@ -473,12 +638,12 @@ export default function App() {
                 {jobs.slice(0, 12).map((entry) => (
                   <button
                     key={entry.id}
-                    onClick={() => { setJob(entry); loadResult(entry); }}
+                    onClick={() => { loadedForRef.current = entry.id; setJob(entry); loadResult(entry); }}
                     className={`panel w-full text-left px-3 py-2 hover:border-ink-600 ${job?.id === entry.id ? 'border-jet-500/60' : ''}`}
                   >
                     <div className="text-xs truncate">{entry.fileName || entry.id}</div>
                     <div className="kicker">
-                      {entry.profile || '—'} · {entry.metrics?.meshFaces
+                      {entry.mode === 'multi' ? `${entry.videoCount || 'multi'} videos · ` : ''}{entry.metrics?.profile || '—'} · {entry.metrics?.meshFaces
                         ? `${Number(entry.metrics.meshFaces).toLocaleString()} faces`
                         : entry.status}
                     </div>
@@ -498,12 +663,13 @@ export default function App() {
       </aside>
 
       {/* ------------------------------------------------- scene + progress */}
-      <main className="h-full grid grid-rows-[1fr_auto] min-w-0">
-        <div className="relative min-h-0 bg-ink-950">
+      <main className="h-full min-h-0 max-md:h-[100vh] grid grid-rows-[minmax(0,1fr)_auto] min-w-0">
+        <div className="relative min-h-0 flex overflow-clip">
+        <div className="relative min-h-0 min-w-0 flex-1 bg-ink-950">
           <canvas ref={canvasRef} className="scene-canvas" />
 
           {/* nav + display controls */}
-          <div className="absolute top-3 left-3 flex flex-wrap gap-2 max-w-[calc(100%-1.5rem)] z-10">
+          <div className="absolute top-3 left-3 flex flex-wrap gap-2 max-w-[calc(100%-7.5rem)] z-10">
             <div className="panel flex p-1 gap-1" role="tablist" aria-label="Scene view">
               {[['viewer', '3D viewer'], ['turntable', 'Turntable']].map(([id, label]) => (
                 <button
@@ -555,6 +721,22 @@ export default function App() {
               ))}
             </div>
             )}
+
+            {sceneView === 'viewer' && (
+            <div className="panel flex p-1 gap-1" aria-label="Enhancement tools">
+              {DRAWER_TABS.map(([id, label]) => (
+                <button
+                  key={id}
+                  className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent ${drawer === id ? 'btn-toggle-on' : ''}`}
+                  aria-pressed={drawer === id}
+                  onClick={() => setDrawer((d) => (d === id ? null : id))}
+                >{label}</button>
+              ))}
+              {lod?.current != null && (
+                <span className="kicker self-center px-2">LOD {lod.current}{lod.loading != null ? ` → ${lod.loading}` : ''}</span>
+              )}
+            </div>
+            )}
           </div>
 
           {/* The turntable covers the canvas rather than replacing it: the
@@ -594,6 +776,10 @@ export default function App() {
           </div>
           )}
 
+          {sceneView === 'viewer' && views && views.id === job?.id && (
+            <DroneViews key={views.id} viewer={viewer} views={views} />
+          )}
+
           {/* hints + measurement readout */}
           <div className="absolute bottom-3 left-3 right-3 flex items-end justify-between gap-3 pointer-events-none">
             <div className="panel px-3 py-2 kicker normal-case tracking-normal text-mist-400">{navHint}</div>
@@ -603,23 +789,17 @@ export default function App() {
           </div>
 
           {/* downloads */}
-          {modelAvailable && (
-            <div className="absolute bottom-16 right-3 panel p-1 flex flex-col gap-1 text-xs">
-              {[
-                ['glb', 'Textured mesh (GLB)'],
-                ['video', 'Turntable video (MP4)'],
-                ['cloud', 'Point cloud (PLY)'],
-                ['mesh', 'Raw mesh (PLY)'],
-                ['splat', 'Gaussian splat (PLY)'],
-                ['terrain', 'Terrain DSM (GLB)'],
-                ['ortho', 'Orthophoto (PNG)'],
-                ['meta', 'Metadata (JSON)'],
-              ].map(([kind, label]) => (
-                <a key={kind} href={fileUrl(job.id, kind)} download className="btn py-1 px-2.5 border-transparent bg-transparent justify-start">
-                  ↓ {label}
-                </a>
-              ))}
-            </div>
+          {modelAvailable && downloads && (
+            <details className="absolute bottom-16 right-3 panel text-xs z-10">
+              <summary className="px-3 py-1.5 cursor-pointer select-none">↓ Downloads</summary>
+              <div className="p-1 flex flex-col gap-1 max-h-64 overflow-y-auto">
+                {DOWNLOADS.filter(([kind]) => downloads[kind]).map(([kind, label]) => (
+                  <a key={kind} href={fileUrl(job.id, kind)} download={downloads[kind].name} className="btn py-1 px-2.5 border-transparent bg-transparent justify-start">
+                    ↓ {label} <span className="text-mist-400">{formatBytes(downloads[kind].bytes)}</span>
+                  </a>
+                ))}
+              </div>
+            </details>
           )}
 
           {loadPct && (
@@ -645,9 +825,16 @@ export default function App() {
             </div>
           )}
         </div>
+          {drawer && (
+            <EnhancementDrawer
+              tab={drawer} onTab={setDrawer} onClose={() => setDrawer(null)}
+              job={job} viewer={viewer} lod={lod} modelVersion={modelVersion} onReload={reloadCurrent}
+            />
+          )}
+        </div>
 
         {/* ------------------------------------------------- pipeline */}
-        <section className="border-t border-ink-700 bg-ink-900 grid grid-cols-[1fr_380px] min-h-0" style={{ height: '248px' }}>
+        <section className="border-t border-ink-700 bg-ink-900 grid grid-cols-[minmax(0,1fr)_380px] max-lg:grid-cols-1 min-h-0" style={{ height: '248px' }}>
           <div className="p-4 overflow-y-auto">
             <div className="flex items-baseline justify-between mb-3">
               <div>
@@ -722,7 +909,7 @@ export default function App() {
           </div>
 
           {/* live log */}
-          <div className="border-l border-ink-700 flex flex-col min-h-0">
+          <div className="border-l border-ink-700 flex flex-col min-h-0 max-lg:hidden">
             <div className="px-3 py-2 border-b border-ink-700 flex items-center justify-between gap-2">
               <p className="kicker shrink-0">Engine log</p>
               <div className="flex items-center gap-1">
@@ -779,23 +966,5 @@ export default function App() {
         </section>
       </main>
     </div>
-  );
-}
-
-function Toggle({ checked, onChange, label, note, disabled }) {
-  return (
-    <label className={`flex gap-2.5 items-start ${disabled ? 'opacity-50' : 'cursor-pointer'}`}>
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 accent-[var(--color-jet-500)] w-4 h-4 shrink-0"
-      />
-      <span className="min-w-0">
-        <span className="block text-xs">{label}</span>
-        {note && <span className="kicker normal-case tracking-normal block mt-0.5 text-mist-400">{note}</span>}
-      </span>
-    </label>
   );
 }

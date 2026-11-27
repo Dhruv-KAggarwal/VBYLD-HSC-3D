@@ -1,7 +1,9 @@
-# Skyforge — single-pass drone video to a measurable, inspectable 3D scene
+# Skyforge — drone video to a measurable, inspectable 3D scene
 
-Takes one drone video and produces a textured 3D mesh you can measure, a dense
-point cloud, and optionally a Gaussian splat you can fly down a street in.
+Takes one drone video, or several videos of the same place, and produces a
+textured 3D mesh you can measure, a dense point cloud, and optionally a Gaussian
+splat you can fly down a street in. It can then repair the mesh, build lighter
+levels of detail and show how well each surface is supported by the footage.
 
 Everything runs locally. No cloud, no account, no upload.
 
@@ -18,6 +20,9 @@ Everything runs locally. No cloud, no account, no upload.
 | Terrain model | `terrain.glb`, `terrain.ply` | Optional. A 2.5D heightfield plus orthophoto, for elevation and ortho work. |
 | Orthophoto | `orthomosaic.png` | Optional, with the terrain model. |
 | Report | `report.json`, `report.md` | Stage timings, measured quality figures, and explicit limitations. |
+| Repaired mesh | `model-repaired.glb`, `repair/` | Optional. Cleaned copy with per-face provenance; the original is kept. |
+| Levels of detail | `lod/` | Optional. Up to four lighter models with measured error. |
+| Confidence | `confidence/` | Optional. Per-face evidence score, regions, heatmap exports. |
 
 Products land in `runtime/<job-id>/products/` and are copied to `output/latest/`.
 
@@ -103,15 +108,37 @@ method set the scale.
 
 ### Profiles
 
-| Profile | Frame width | Mesh refinement | Use for |
+| Profile | Frame width | Mesh | Use for |
 |---|---|---|---|
-| Rapid | up to 1280px | no | Checking a flight is usable |
-| Balanced | up to 1920px | no | Most work |
-| Detailed | up to 2560px | yes | Final deliverable; sharpest facades |
+| Rapid | up to 1280px | up to 250k triangles | Checking a flight is usable |
+| Balanced | up to 1920px | up to 400k triangles | Most work |
+| Detailed | up to 2560px | up to 1.8M triangles, 8192px texture (6 GB+ GPU) | Final deliverable; sharpest buildings, much slower |
+
+Photo-consistent mesh refinement is off in every profile; set
+`SKYFORGE_MESH_REFINE=1` to try it.
 
 Frames are never upscaled past the source resolution. A 1080p clip on
 *Detailed* is extracted at 1920px, not 2560px — upscaling adds no detail and
 costs quadratically in the dense and texture stages.
+
+---
+
+## Multi-video, repair, levels of detail, confidence
+
+| Feature | In the console | Command line |
+|---|---|---|
+| Several videos into one model | *Footage → Multi-video* | `node reconstruct-cli.mjs a.mp4 b.mp4 c.mp4` |
+| Mesh repair | *After reconstruction*, or the **Repair** tab | `--repair`, or `--tool=repair --reuse=runtime/<job>` |
+| Levels of detail | *After reconstruction*, or **Optimize** | `--lod`, or `--tool=lod --reuse=…` |
+| Confidence heatmap | *After reconstruction*, or **Confidence** | `--confidence`, or `--tool=confidence --reuse=…` |
+
+How each works, what it can and cannot claim, and every setting:
+[`docs/ENHANCEMENTS.md`](docs/ENHANCEMENTS.md). Endpoints and binary formats:
+[`docs/API.md`](docs/API.md).
+
+All four run offline with no new dependencies: simplification uses the
+meshoptimizer build shipped inside three.js, and `npm run build` copies three's
+Draco and Basis decoders into the app so the viewer never calls a CDN.
 
 ---
 
@@ -123,6 +150,11 @@ Three navigation modes, because orbit alone is useless at ground level:
 - **Fly** — WASD to move, Q/E for down/up, mouse to look, scroll to change
   speed, Esc to exit.
 - **Walk** — street level, camera pinned to eye height above the surface.
+
+**Drone views.** A reconstruction opens looking through one of the video's own
+cameras. The slider steps along the flight, *Overview* frames the filmed area,
+and *Filmed area only* hides the thinly observed surroundings out to the horizon
+(display only; nothing is deleted).
 
 Display modes: *authored* uses the material as exported (unlit for a baked
 atlas, which is correct — the photo already contains the scene's lighting),
@@ -191,6 +223,10 @@ longer happen; if it does, re-measure and update `referenceSeconds`.
 
 **"cuDNN 9 not found".** Expected until you run `npm run setup:cudnn`. The
 pipeline falls back to SIFT.
+
+**No OpenMVS?** The COLMAP fallback meshes the fused cloud with COLMAP's
+Delaunay mesher and colours it per vertex. That step is single-threaded and can
+take 15 minutes or more on a cloud of a few million points.
 
 **Reconstruction produced no viewable model.** The dense mesh could not be
 built or textured. The log names the stage. This is deliberately a hard error:

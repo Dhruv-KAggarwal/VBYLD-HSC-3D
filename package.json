@@ -4,9 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node tools/copy-decoders.mjs",
     "dev": "vite",
     "api": "node server.mjs",
-    "start": "vite build && node server.mjs",
+    "start": "npm run build && node server.mjs",
+    "prebuild": "node tools/copy-decoders.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node tools/test-texture.mjs && node tools/selftest.mjs",

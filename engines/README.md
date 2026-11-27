@@ -29,11 +29,25 @@ CPU-only COLMAP will crawl. Use a **CUDA** build.
 
 If `colmap mapper -h` does **not** list `--Mapper.ba_global_frames_ratio`, you have COLMAP 3.x. This project is written for 4.2 (`frames_ratio`, not `images_ratio`).
 
-## OpenMVS (optional)
+## OpenMVS 2.3.0 (needed for the textured 3D mesh)
 
-The default surface is a COLMAP dense cloud + gravity-aligned DSM. OpenMVS is not required.
+1. Download **OpenMVS_Windows_x64.7z** (about 11 MB) from
+   https://github.com/cdcseacave/openMVS/releases/tag/v2.3.0
+2. Extract the `.exe` and `.dll` files into `engines/openmvs/` (Windows 11:
+   `tar -xf OpenMVS_Windows_x64.7z`)
+3. Optional check: `Get-FileHash OpenMVS_Windows_x64.7z` printed
+   `E1B7AE31AD078160059005B1BFED10280C14E99EE2579F5F806CCAFF05C784CA` for the
+   copy this project was verified with (the release publishes no checksum).
 
-If you still want it, extract OpenMVS 2.4 CUDA into `engines/openmvs/`.
+It uses CUDA through the NVIDIA driver, so no CUDA Toolkit is needed.
+
+**Do not use the official 2.4.0 CUDA download** unless you have an RTX 40-series
+card. It contains GPU code for that architecture only, and on any other GPU
+densification stops with `CUDA error ... named symbol not found (code 500)`
+(upstream issue 1315).
+
+Without OpenMVS the pipeline falls back to COLMAP dense stereo and a
+vertex-coloured Delaunay mesh: slower to mesh, and no texture atlas.
 
 ## Custom install locations
 

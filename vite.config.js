@@ -9,6 +9,7 @@ const apiPort = process.env.PORT || '8787';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    host: '0.0.0.0',
     port: 5173,
     proxy: {
       '/api': `http://localhost:${apiPort}`,

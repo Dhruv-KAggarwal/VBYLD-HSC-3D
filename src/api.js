@@ -94,6 +94,7 @@ export async function startReconstruction(file, options) {
   if (options.splat) headers['X-Splat'] = '1';
   if (options.dsm) headers['X-Dsm'] = '1';
   if (options.maskDynamic) headers['X-Mask-Dynamic'] = '1';
+  if (options.enhance) headers['X-Enhance'] = encodeURIComponent(JSON.stringify(options.enhance));
 
   const response = await fetch(`${API}/api/reconstruct`, { method: 'POST', headers, body: file });
   if (!response.ok) {
@@ -172,4 +173,144 @@ export function watchJob(id, { onUpdate, onDone, onError, onLog }) {
   }
 
   return () => { stopped = true; cleanup(); };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-video uploads
+// ---------------------------------------------------------------------------
+
+async function request(path, options = {}) {
+  const response = await fetch(`${API}${path}`, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.error || `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    error.stale = Boolean(body.stale);
+    throw error;
+  }
+  return body;
+}
+
+const json = (method, value) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value || {}) });
+
+const uploadQuery = ({ quality, frames } = {}) => {
+  const query = new URLSearchParams();
+  if (quality) query.set('quality', quality);
+  if (frames) query.set('frames', String(frames));
+  const text = query.toString();
+  return text ? `?${text}` : '';
+};
+
+export const createUpload = (options) => request(`/api/uploads${uploadQuery(options)}`, { method: 'POST' });
+export const getUpload = (id, options) => request(`/api/uploads/${id}${uploadQuery(options)}`);
+export const updateUpload = (id, changes, options) => request(`/api/uploads/${id}${uploadQuery(options)}`, json('PATCH', changes));
+export const deleteUpload = (id) => request(`/api/uploads/${id}`, { method: 'DELETE' });
+export const deleteUploadVideo = (id, videoId, options) => request(`/api/uploads/${id}/videos/${videoId}${uploadQuery(options)}`, { method: 'DELETE' });
+export const uploadThumbnailUrl = (id, video) => `${API}/api/uploads/${id}/videos/${video.id}/thumbnail?v=${video.sha256?.slice(0, 8)}`;
+
+/**
+ * Upload one video. XMLHttpRequest rather than fetch, because only it reports
+ * upload progress. Returns the promise and an abort function.
+ */
+export function uploadVideo(sessionId, file, { replace = null, onProgress = null } = {}) {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise((resolve, reject) => {
+    xhr.open('POST', `${API}/api/uploads/${sessionId}/videos${replace ? `?replace=${replace}` : ''}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(event.loaded / event.total);
+    };
+    xhr.onload = () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+      else reject(new Error(body.error || `Upload failed: ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error('The upload connection failed.'));
+    xhr.onabort = () => reject(Object.assign(new Error('Upload cancelled.'), { aborted: true }));
+    xhr.send(file);
+  });
+  return { promise, abort: () => xhr.abort() };
+}
+
+export const startMultiReconstruction = (uploadId, options) => request('/api/reconstruct', json('POST', { uploadId, options }));
+
+// ---------------------------------------------------------------------------
+// Job products: videos, repair, levels of detail, confidence
+// ---------------------------------------------------------------------------
+
+const job = (id, path) => `/api/reconstruct/${id}/${path}`;
+
+export const getArtifacts = (id) => request(job(id, 'artifacts'));
+export const setActiveModel = (id, model) => request(job(id, 'active-model'), json('POST', { model }));
+export const getJobVideos = (id) => request(job(id, 'videos'));
+export const getViews = (id) => request(job(id, 'views'));
+export const jobThumbnailUrl = (id, videoId) => `${API}${job(id, `videos/${videoId}/thumbnail`)}`;
+export const getConnectivity = (id) => request(job(id, 'connectivity'));
+export const getMeshQuality = async (id) => {
+  const response = await fetch(`${API}${job(id, 'mesh-quality')}`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Mesh analysis unavailable: ${response.status}`);
+  // 202: the analysis has just been started as a task.
+  return response.status === 202 ? { pending: true, task: body.task } : body;
+};
+export const startRepair = (id, settings) => request(job(id, 'repair'), json('POST', settings));
+export const getRepairReport = (id) => request(job(id, 'repair-report'));
+export const startConfidence = (id, settings) => request(job(id, 'confidence/analyze'), json('POST', settings));
+export const getConfidence = (id, model) => request(job(id, `confidence${model ? `?model=${model}` : ''}`));
+export const getConfidenceRegions = (id, model) => request(job(id, `confidence/regions${model ? `?model=${model}` : ''}`));
+export const startLod = (id, settings) => request(job(id, 'lod/generate'), json('POST', settings));
+export const getLodManifest = (id) => request(job(id, 'lod'));
+export const lodUrl = (id, level, token = '') => `${API}${job(id, `lod/${level}`)}?t=${encodeURIComponent(token)}`;
+export const componentUrl = (id, number) => `${API}${job(id, `components/${number}/model`)}`;
+export const cancelTask = (id) => request(job(id, 'tasks/cancel'), { method: 'POST' });
+export const getTask = (id) => request(job(id, 'tasks'));
+
+/** A binary sidecar (confidence or provenance records). */
+export async function getBinary(path) {
+  const response = await fetch(`${API}${path}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `${response.status} ${response.statusText}`);
+  }
+  return response.arrayBuffer();
+}
+
+export const confidenceDataPath = (id, model, level = 0) => (level
+  ? job(id, `lod/${level}/confidence`)
+  : job(id, `confidence/data?model=${model}`));
+export const provenanceDataPath = (id, level = 0) => (level ? job(id, `lod/${level}/provenance`) : job(id, 'provenance'));
+
+/** Follow the enhancement task of a job: SSE first, polling if it drops. */
+export function watchTask(id, onUpdate) {
+  let stopped = false;
+  let source = null;
+  let timer = null;
+  const stop = () => {
+    stopped = true;
+    source?.close();
+    if (timer) clearInterval(timer);
+  };
+  const take = (task) => {
+    if (stopped) return;
+    onUpdate(task);
+    if (!task || (task.status !== 'queued' && task.status !== 'running')) stop();
+  };
+  const poll = () => {
+    if (stopped || timer) return;
+    timer = setInterval(async () => {
+      try { take((await getTask(id)).task); } catch { /* server restarting */ }
+    }, 1000);
+  };
+  try {
+    source = new EventSource(`${API}${job(id, 'tasks/stream')}`);
+    const read = (event) => take(JSON.parse(event.data).task);
+    source.addEventListener('progress', read);
+    source.addEventListener('done', read);
+    source.onerror = () => { source?.close(); source = null; poll(); };
+  } catch {
+    poll();
+  }
+  return stop;
 }

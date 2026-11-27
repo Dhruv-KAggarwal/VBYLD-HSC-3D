@@ -39,6 +39,10 @@ import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 import { GaussianSplatPLYLoader } from 'three/addons/loaders/GaussianSplatPLYLoader.js';
 import { GaussianSplat } from 'three/addons/objects/GaussianSplat.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { MeshBVH } from '../lib/bvh.mjs';
+import { FaceOverlay } from './viewer/overlay-renderer.js';
+import { ComparisonController } from './viewer/comparison-controller.js';
+import { LodManager } from './viewer/lod-manager.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -122,12 +126,32 @@ export class ModelViewer {
     this.onMeasure = null;
     this.onProgress = null;
     this.onNavChange = null;
+    this.onInspect = null;
+    this.onLodState = null;
+    this.onLodChange = null;
+    this.onModelShown = null;
+
+    // --- Enhancements -------------------------------------------------------
+    this.overlay = new FaceOverlay();
+    this.comparison = new ComparisonController(this);
+    this.lod = null;
+    this.inspect = false;
+    this.wireframe = false;
+    this.scaleReliable = true;
+    this.highlight = null;
+    this.perf = { fps: null, frameMs: null, last: 0 };
+    // Camera positions of the source video and the area they filmed.
+    this.views = null;
+    this.focusClip = false;
+    this.defaultFov = 55;
 
     // --- Loaders ------------------------------------------------------------
     // Compressed-geometry and compressed-texture support, so a large mesh
     // streams instead of arriving as one uncompressed blob.
-    this.dracoLoader = new DRACOLoader().setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
-    this.ktx2Loader = new KTX2Loader().setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/libs/basis/');
+    // Decoders are served by this app (copied from three at build time), so a
+    // compressed asset opens without a network connection.
+    this.dracoLoader = new DRACOLoader().setDecoderPath('/decoders/draco/');
+    this.ktx2Loader = new KTX2Loader().setTranscoderPath('/decoders/basis/');
     try { this.ktx2Loader.detectSupport(this.renderer); } catch { /* optional */ }
     this.gltfLoader = new GLTFLoader()
       .setDRACOLoader(this.dracoLoader)
@@ -162,7 +186,18 @@ export class ModelViewer {
   // -------------------------------------------------------------------------
 
   bindInput() {
-    this.canvas.addEventListener('pointerdown', (event) => this.onPointerDown(event));
+    this.canvas.addEventListener('pointerdown', (event) => {
+      this.pressed = { x: event.clientX, y: event.clientY, button: event.button };
+      this.onPointerDown(event);
+    });
+    // Inspection acts on a click, not on the start of an orbit drag.
+    this.canvas.addEventListener('pointerup', (event) => {
+      const start = this.pressed;
+      this.pressed = null;
+      if (!this.inspect || this.measureMode !== 'off' || !start || start.button !== 0) return;
+      if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
+      this.inspectAt(event);
+    });
     window.addEventListener('keydown', (event) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       this.keys.add(event.code);
@@ -214,7 +249,9 @@ export class ModelViewer {
     const from = new THREE.Vector3(this.camera.position.x, this.camera.position.y + this.boundsRadius, this.camera.position.z);
     this.raycaster.set(from, new THREE.Vector3(0, -1, 0));
     this.raycaster.far = this.boundsRadius * 4;
-    const hit = this.raycaster.intersectObject(target, true)[0];
+    const hit = target.isPoints
+      ? this.raycaster.intersectObject(target, true)[0]
+      : this.pickModel(this.raycaster, target);
     if (hit) this.camera.position.y = hit.point.y + this.walkHeight;
     this.invalidate();
   }
@@ -250,8 +287,8 @@ export class ModelViewer {
   // -------------------------------------------------------------------------
 
   /** Fetch with byte progress, since a textured town mesh is tens of MB. */
-  async fetchWithProgress(url) {
-    const response = await fetch(url);
+  async fetchWithProgress(url, { signal = null, quiet = false } = {}) {
+    const response = await fetch(url, signal ? { signal } : undefined);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const total = Number(response.headers.get('content-length')) || 0;
     if (!response.body) return new Uint8Array(await response.arrayBuffer());
@@ -264,7 +301,7 @@ export class ModelViewer {
       if (done) break;
       chunks.push(value);
       loaded += value.length;
-      this.onProgress?.(total ? loaded / total : 0, loaded, total);
+      if (!quiet) this.onProgress?.(total ? loaded / total : 0, loaded, total);
     }
     const packed = new Uint8Array(loaded);
     let offset = 0;
@@ -272,13 +309,12 @@ export class ModelViewer {
     return packed;
   }
 
-  async loadGlb(url) {
-    const packed = await this.fetchWithProgress(url);
+  /** Download and parse a GLB without putting it in the scene. */
+  async loadModelData(url, { signal = null, quiet = true } = {}) {
+    const packed = await this.fetchWithProgress(url, { signal, quiet });
     const gltf = await new Promise((resolve, reject) => {
       this.gltfLoader.parse(packed.buffer, '', resolve, reject);
     });
-
-    this.disposeObject(this.objects.mesh);
     const model = gltf.scene;
     let hasTexture = false;
     let hasVertexColor = false;
@@ -302,13 +338,71 @@ export class ModelViewer {
         material.needsUpdate = true;
       }
     });
+    model.updateMatrixWorld(true);
+    return { model, gltf, hasTexture, hasVertexColor };
+  }
 
+  async loadGlb(url) {
+    const { model, gltf, hasTexture, hasVertexColor } = await this.loadModelData(url);
+    this.showModel(model, { fit: true });
+    return { gltf, hasTexture, hasVertexColor };
+  }
+
+  /**
+   * Put a model on screen. The camera, navigation mode and measurements are
+   * untouched unless `fit` is set. `owned: false` models belong to a cache and
+   * are not disposed when replaced.
+   */
+  showModel(model, { fit = false, owned = true } = {}) {
+    const previous = this.objects.mesh;
+    this.overlay.detach();
+    if (previous && previous !== model) {
+      if (previous.userData.owned) this.disposeObject(previous);
+      else previous.removeFromParent();
+    }
+    model.userData.owned = owned;
     this.objects.mesh = model;
     this.root.add(model);
+    model.updateMatrixWorld(true);
     this.applyShading();
-    this.fit(model);
+    if (fit) this.fit(model);
     this.applyLayers();
-    return { gltf, hasTexture, hasVertexColor };
+    this.onModelShown?.();
+  }
+
+  releaseModel(model) {
+    if (this.objects.mesh !== model) return;
+    this.overlay.detach();
+    model.removeFromParent();
+    this.objects.mesh = null;
+    this.invalidate();
+  }
+
+  cameraState() {
+    return { position: this.camera.position.clone(), quaternion: this.camera.quaternion.clone(), target: this.orbit.target.clone() };
+  }
+
+  restoreCamera(saved) {
+    this.camera.position.copy(saved.position);
+    this.camera.quaternion.copy(saved.quaternion);
+    this.orbit.target.copy(saved.target);
+    if (this.navMode === 'orbit') this.orbit.update();
+    this.invalidate();
+  }
+
+  /** Switch to automatic level-of-detail display for the current job. */
+  async openLod(manifest, urlFor) {
+    this.closeLod();
+    this.lod = new LodManager(this, { onState: (state) => this.onLodState?.(state) });
+    await this.lod.open(manifest, urlFor);
+    if (this.measureMode !== 'off') this.lod.setMeasuring(true);
+  }
+
+  closeLod() {
+    if (!this.lod) return;
+    this.lod.dispose();
+    this.lod = null;
+    this.onLodState?.(null);
   }
 
   /** Dense point cloud, so the raw measurement is inspectable on its own. */
@@ -357,7 +451,11 @@ export class ModelViewer {
     if (!object) return;
     object.traverse?.((node) => {
       node.geometry?.dispose?.();
-      const materials = Array.isArray(node.material) ? node.material : [node.material];
+      if (node.geometry?.userData) delete node.geometry.userData.bvh;
+      const { authoredMaterial, flatMaterial, shadedMaterial } = node.userData || {};
+      const materials = new Set([].concat(node.material, authoredMaterial, flatMaterial, shadedMaterial));
+      // The overlay material is shared and outlives any one model.
+      if (node.userData?.isOverlay) materials.clear();
       for (const material of materials) {
         if (!material) continue;
         for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'aoMap']) {
@@ -369,12 +467,16 @@ export class ModelViewer {
     object.removeFromParent?.();
   }
 
-  clearModel() {
+  clearModel({ keepMeasure = false } = {}) {
+    this.comparison.disable();
+    this.closeLod();
+    this.overlay.detach();
+    this.clearHighlight();
     for (const key of Object.keys(this.objects)) {
       this.disposeObject(this.objects[key]);
       this.objects[key] = null;
     }
-    this.clearMeasure();
+    if (!keepMeasure) this.clearMeasure();
     this.invalidate();
   }
 
@@ -392,7 +494,8 @@ export class ModelViewer {
 
     // A town model spans hundreds of metres but we want to stand next to a
     // wall, so the near plane has to be small in absolute terms, not relative.
-    this.camera.near = Math.min(0.05, radius / 5000);
+    // Near/far ratio kept modest, or distant surfaces flicker into each other.
+    this.camera.near = Math.min(0.5, Math.max(0.05, radius / 5000));
     this.camera.far = radius * 60;
     this.camera.updateProjectionMatrix();
 
@@ -418,15 +521,89 @@ export class ModelViewer {
     this.invalidate();
   }
 
+  // -------------------------------------------------------------------------
+  // Drone views and the filmed area
+  // -------------------------------------------------------------------------
+
+  /** Adopt the source cameras of the loaded job (null clears them). */
+  setViews(data, { jump = true } = {}) {
+    this.views = data;
+    if (!data) { this.setFocusClip(false); return; }
+    // Speeds, markers and walking scale with the filmed area, not the horizon.
+    this.boundsRadius = Math.max(10, data.focus.radius);
+    this.moveSpeed = Math.max(0.1, this.boundsRadius / 60);
+    const y = data.focus.center[1];
+    this.grid.position.set(data.focus.center[0], Math.min(this.grid.position.y, y), data.focus.center[2]);
+    this.grid.scale.setScalar(Math.max(0.1, this.boundsRadius / 200));
+    if (jump) this.showDroneView(data.start);
+  }
+
+  /** Look through the camera that took one video frame. */
+  showDroneView(index) {
+    const view = this.views?.views[index];
+    if (!view) return;
+    this.setNavMode('orbit');
+    this.clearHighlight();
+    // Match the video's framing: widen if the window is narrower than 16:9.
+    const widen = Math.max(1, (16 / 9) / Math.max(0.2, this.camera.aspect));
+    this.camera.fov = Math.min(90, (2 * Math.atan(Math.tan((view.fov * Math.PI) / 360) * widen) * 180) / Math.PI);
+    this.camera.updateProjectionMatrix();
+    this.camera.position.set(...view.position);
+    this.orbit.target.set(...view.target);
+    this.orbit.update();
+    this.invalidate();
+  }
+
+  /** The whole filmed area from above and to one side. */
+  showOverview() {
+    if (!this.views) { if (this.objects.mesh) this.fit(this.objects.mesh); return; }
+    const { focus, views, start } = this.views;
+    this.setNavMode('orbit');
+    const target = new THREE.Vector3(...focus.center);
+    const from = new THREE.Vector3(...views[start].position).sub(target);
+    from.y = 0;
+    if (from.lengthSq() < 1e-6) from.set(1, 0, 1);
+    from.normalize().multiplyScalar(focus.radius * 1.5);
+    from.y = focus.radius * 1.1;
+    this.camera.fov = this.defaultFov;
+    this.camera.updateProjectionMatrix();
+    this.camera.position.copy(target).add(from);
+    this.orbit.target.copy(target);
+    this.orbit.update();
+    this.invalidate();
+  }
+
+  /** Hide everything outside the filmed area. Display only; nothing is removed. */
+  setFocusClip(on) {
+    this.focusClip = Boolean(on && this.views);
+    const planes = [];
+    if (this.focusClip) {
+      const { min, max } = this.views.focus;
+      planes.push(
+        new THREE.Plane(new THREE.Vector3(1, 0, 0), -min[0]),
+        new THREE.Plane(new THREE.Vector3(-1, 0, 0), max[0]),
+        new THREE.Plane(new THREE.Vector3(0, 0, 1), -min[1]),
+        new THREE.Plane(new THREE.Vector3(0, 0, -1), max[1]),
+      );
+    }
+    this.renderer.clippingPlanes = planes;
+    this.invalidate();
+  }
+
+  isVisiblePoint(point) {
+    return this.renderer.clippingPlanes.every((plane) => plane.distanceToPoint(point) >= 0);
+  }
+
   setLayers(layers) {
     this.layers = { ...this.layers, ...layers };
     this.applyLayers();
   }
 
   applyLayers() {
-    if (this.objects.mesh) this.objects.mesh.visible = this.layers.mesh !== false;
-    if (this.objects.splat) this.objects.splat.visible = this.layers.splat !== false;
-    if (this.objects.cloud) this.objects.cloud.visible = this.layers.points === true;
+    const comparing = this.comparison.active;
+    if (this.objects.mesh) this.objects.mesh.visible = !comparing && this.layers.mesh !== false;
+    if (this.objects.splat) this.objects.splat.visible = !comparing && this.layers.splat !== false;
+    if (this.objects.cloud) this.objects.cloud.visible = !comparing && this.layers.points === true;
     this.grid.visible = this.layers.grid !== false;
     this.invalidate();
   }
@@ -445,7 +622,7 @@ export class ModelViewer {
     const model = this.objects.mesh;
     if (!model) return;
     model.traverse((node) => {
-      if (!node.isMesh || !node.material) return;
+      if (!node.isMesh || !node.material || node.userData.isOverlay) return;
       if (!node.userData.authoredMaterial) node.userData.authoredMaterial = node.material;
       const authored = node.userData.authoredMaterial;
 
@@ -469,25 +646,112 @@ export class ModelViewer {
           side: THREE.DoubleSide,
         });
       }
+      node.material.wireframe = this.wireframe;
       node.material.needsUpdate = true;
     });
+    // Materials were swapped, so re-apply what the overlay does to them.
+    this.overlay.update();
+    this.invalidate();
+  }
+
+  setWireframe(on) {
+    this.wireframe = on;
+    this.applyShading();
+    for (const model of this.comparison.list()) {
+      model.traverse((node) => { if (node.isMesh && !node.userData.isOverlay) node.material.wireframe = on; });
+    }
     this.invalidate();
   }
 
   // -------------------------------------------------------------------------
-  // Measurement
+  // Overlays, comparison, inspection
   // -------------------------------------------------------------------------
 
-  setMeasureMode(mode) {
-    this.measureMode = mode;
-    this.clearMeasure();
-    this.onMeasure?.({ mode, message: mode === 'off' ? '' : measurePrompt(mode) });
+  /** Attach per-face data (confidence and/or provenance) to the shown model. */
+  setOverlayData(data) {
+    if (!data || !this.objects.mesh) this.overlay.detach();
+    else this.overlay.attach(this.objects.mesh, data);
+    this.invalidate();
   }
 
-  onPointerDown(event) {
-    if (this.measureMode === 'off' || event.button !== 0) return;
-    if (this.navMode !== 'orbit' && !this.pointerLock.isLocked) return;
+  setOverlay(settings) {
+    this.overlay.update(settings);
+    this.invalidate();
+  }
 
+  setComparisonActive(active) {
+    if (active) {
+      this.overlay.detach();
+      this.setWireframe(this.wireframe);
+    }
+    this.applyLayers();
+  }
+
+  setInspect(on) { this.inspect = on; }
+
+  /** Nearest hit on a model's triangles, using a BVH built on first use. */
+  pickModel(raycaster, model) {
+    if (!this.focusClip) return this.pickAnywhere(raycaster, model);
+    // Step past surfaces the focus filter hides.
+    const origin = raycaster.ray.origin.clone();
+    let travelled = 0;
+    let found = null;
+    for (let i = 0; i < 12; i += 1) {
+      const hit = this.pickAnywhere(raycaster, model);
+      if (!hit) break;
+      if (this.isVisiblePoint(hit.point)) { found = { ...hit, distance: hit.distance + travelled }; break; }
+      const step = hit.distance + Math.max(0.01, hit.distance * 1e-5);
+      travelled += step;
+      raycaster.ray.origin.addScaledVector(raycaster.ray.direction, step);
+    }
+    raycaster.ray.origin.copy(origin);
+    return found;
+  }
+
+  pickAnywhere(raycaster, model) {
+    let best = null;
+    let running = 0;
+    model.traverse((node) => {
+      if (!node.isMesh || node.userData.isOverlay) return;
+      const { geometry } = node;
+      const count = (geometry.index ? geometry.index.count : geometry.attributes.position.count) / 3;
+      const offset = geometry.userData.skyforgeFaceOffset ?? running;
+      running += count;
+      if (!geometry.userData.bvh) {
+        const source = geometry.attributes.position;
+        const positions = new Float32Array(source.count * 3);
+        for (let i = 0; i < source.count; i += 1) {
+          positions[i * 3] = source.getX(i);
+          positions[i * 3 + 1] = source.getY(i);
+          positions[i * 3 + 2] = source.getZ(i);
+        }
+        const indices = geometry.index
+          ? geometry.index.array
+          : Uint32Array.from({ length: source.count }, (_, i) => i);
+        geometry.userData.bvh = new MeshBVH(positions, indices);
+      }
+      // The ray in the mesh's local frame; leaving the direction unnormalised
+      // keeps the hit parameter equal to the world-space one.
+      const inverse = node.matrixWorld.clone().invert();
+      const origin = raycaster.ray.origin.clone().applyMatrix4(inverse);
+      const tip = raycaster.ray.origin.clone().add(raycaster.ray.direction).applyMatrix4(inverse);
+      const direction = tip.sub(origin);
+      const hit = geometry.userData.bvh.raycast(
+        origin.x, origin.y, origin.z, direction.x, direction.y, direction.z, best ? best.distance : raycaster.far,
+      );
+      if (hit) {
+        best = {
+          distance: hit.t,
+          point: raycaster.ray.at(hit.t, new THREE.Vector3()),
+          node,
+          face: offset + hit.face,
+        };
+      }
+    });
+    return best;
+  }
+
+  aimAt(event) {
     const rect = this.canvas.getBoundingClientRect();
     if (this.navMode === 'orbit') {
       this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -498,10 +762,95 @@ export class ModelViewer {
       this.raycaster.setFromCamera(new THREE.Vector2(0, 0), this.camera);
     }
     this.raycaster.far = this.boundsRadius * 60;
+  }
 
-    const targets = [this.objects.mesh, this.objects.cloud].filter(Boolean);
-    if (!targets.length) return;
-    const hit = this.raycaster.intersectObjects(targets, true)[0];
+  inspectAt(event) {
+    if (!this.objects.mesh || this.comparison.active) return;
+    this.aimAt(event);
+    const hit = this.pickModel(this.raycaster, this.objects.mesh);
+    if (hit) this.onInspect?.({ face: hit.face, point: hit.point });
+  }
+
+  /** Frame a low-confidence region from the side its surface faces. */
+  focusRegion({ boundingBox, centre, normal }) {
+    this.setNavMode('orbit');
+    const box = new THREE.Box3(new THREE.Vector3(...boundingBox.min), new THREE.Vector3(...boundingBox.max));
+    const size = box.getSize(new THREE.Vector3()).length() || this.boundsRadius * 0.1;
+    const target = new THREE.Vector3(...centre);
+    const direction = new THREE.Vector3(...normal);
+    if (direction.y < 0.15) direction.y = 0.15 + Math.max(0, -direction.y);
+    direction.normalize();
+    this.camera.position.copy(target).addScaledVector(direction, Math.max(size * 1.4, this.boundsRadius * 0.05));
+    this.orbit.target.copy(target);
+    this.orbit.update();
+    this.clearHighlight();
+    this.highlight = new THREE.Box3Helper(box, 0xffffff);
+    this.highlight.material.depthTest = false;
+    this.scene.add(this.highlight);
+    this.invalidate();
+  }
+
+  clearHighlight() {
+    if (!this.highlight) return;
+    this.scene.remove(this.highlight);
+    this.highlight.geometry.dispose();
+    this.highlight.material.dispose();
+    this.highlight = null;
+    this.invalidate();
+  }
+
+  /** Distance that the LOD screen-space error is projected over. */
+  viewDistance() {
+    if (this.navMode === 'orbit') return this.camera.position.distanceTo(this.orbit.target);
+    // Flying: assume surfaces are near, scaled to the scene.
+    return this.boundsRadius * 0.08;
+  }
+
+  performanceStats() {
+    return { fps: this.perf.fps, frameMs: this.perf.frameMs, age: performance.now() - this.perf.last };
+  }
+
+  // -------------------------------------------------------------------------
+  // Measurement
+  // -------------------------------------------------------------------------
+
+  setMeasureMode(mode) {
+    this.measureMode = mode;
+    this.clearMeasure();
+    this.lod?.setMeasuring(mode !== 'off');
+    this.onMeasure?.({ mode, message: mode === 'off' ? '' : measurePrompt(mode) });
+  }
+
+  /** Report a measurement together with anything that limits its accuracy. */
+  reportMeasurement(result) {
+    const notes = [];
+    if (this.measuredOn && !this.measuredOn.full) {
+      notes.push(`measured on simplified level ${this.measuredOn.level}${this.measuredOn.loading ? ', full resolution still loading' : ''}`);
+    }
+    if (!this.scaleReliable) notes.push('scene scale is approximate');
+    this.onMeasure?.({ ...result, message: notes.length ? `${result.message} · ${notes.join('; ')}` : result.message });
+  }
+
+  onPointerDown(event) {
+    if (this.measureMode === 'off' || event.button !== 0) return;
+    if (this.navMode !== 'orbit' && !this.pointerLock.isLocked) return;
+
+    this.aimAt(event);
+
+    // Measure against full-resolution geometry whatever level is displayed.
+    let model = this.objects.mesh;
+    this.measuredOn = null;
+    if (this.comparison.active) {
+      const [original, repaired] = this.comparison.list();
+      model = this.comparison.mode === 'original' ? original : repaired;
+    } else if (this.lod) {
+      this.measuredOn = this.lod.measurementModel();
+      model = this.measuredOn?.model || model;
+    }
+    const hits = [];
+    if (model) hits.push(this.pickModel(this.raycaster, model));
+    if (this.objects.cloud?.visible) hits.push(this.raycaster.intersectObject(this.objects.cloud, true)[0]);
+    const hit = hits.filter(Boolean).sort((a, b) => a.distance - b.distance)[0];
     if (!hit) return;
 
     this.measurePoints.push(hit.point.clone());
@@ -515,7 +864,7 @@ export class ModelViewer {
       const [a, b] = pts.slice(-2);
       this.addLine(a, b);
       const metres = a.distanceTo(b);
-      this.onMeasure?.({
+      this.reportMeasurement({
         mode: 'distance',
         metres,
         message: `Distance ${formatMetres(metres)} (horizontal ${formatMetres(Math.hypot(b.x - a.x, b.z - a.z))}, vertical ${formatMetres(Math.abs(b.y - a.y))})`,
@@ -528,13 +877,13 @@ export class ModelViewer {
       this.addLine(a, foot);
       this.addLine(foot, b);
       const metres = Math.abs(b.y - a.y);
-      this.onMeasure?.({ mode: 'height', metres, message: `Height ${formatMetres(metres)}` });
+      this.reportMeasurement({ mode: 'height', metres, message: `Height ${formatMetres(metres)}` });
       this.measurePoints = [];
     } else if (this.measureMode === 'area' && pts.length >= 2) {
       this.addLine(pts[pts.length - 2], pts[pts.length - 1]);
       if (pts.length >= 3) {
         const metres = polygonAreaXZ(pts);
-        this.onMeasure?.({
+        this.reportMeasurement({
           mode: 'area',
           metres,
           message: `Area ${metres.toFixed(metres < 100 ? 2 : 0)} m² over ${pts.length} points — click to add, double-click to finish`,
@@ -589,9 +938,22 @@ export class ModelViewer {
       // Damping keeps producing motion for a few frames after input stops.
       if (this.orbit.update()) this.invalidate();
     }
+    const now = performance.now();
+    this.lod?.update(now);
     if (!this.needsRender) return;
     this.needsRender = false;
-    this.renderer.render(this.scene, this.camera);
+    // Frame rate is only meaningful across consecutive frames; the loop idles
+    // when nothing changes.
+    const gap = now - this.perf.last;
+    if (gap > 0 && gap < 250) {
+      const fps = 1000 / gap;
+      this.perf.fps = this.perf.fps == null ? fps : this.perf.fps * 0.9 + fps * 0.1;
+    }
+    this.perf.last = now;
+    if (this.comparison.active) this.comparison.render(this.renderer, this.scene, this.camera);
+    else this.renderer.render(this.scene, this.camera);
+    const spent = performance.now() - now;
+    this.perf.frameMs = this.perf.frameMs == null ? spent : this.perf.frameMs * 0.9 + spent * 0.1;
   }
 }
 

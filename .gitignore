@@ -52,3 +52,6 @@ engines/cudnn/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Decoders copied from three.js by tools/copy-decoders.mjs
+public/decoders/
