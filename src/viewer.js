@@ -36,13 +36,12 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
-import { GaussianSplatPLYLoader } from 'three/addons/loaders/GaussianSplatPLYLoader.js';
-import { GaussianSplat } from 'three/addons/objects/GaussianSplat.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { MeshBVH } from '../lib/bvh.mjs';
 import { FaceOverlay } from './viewer/overlay-renderer.js';
 import { ComparisonController } from './viewer/comparison-controller.js';
 import { LodManager } from './viewer/lod-manager.js';
+import { SplatView } from './viewer/splat-view.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -101,6 +100,10 @@ export class ModelViewer {
 
     this.pointerLock = new PointerLockControls(this.camera, canvas);
     this.pointerLock.addEventListener('change', () => this.invalidate());
+    // The browser can take the mouse back on its own (Esc, switching window) or
+    // refuse to give it. Either way fly and walk cannot continue.
+    this.pointerLock.addEventListener('unlock', () => this.setNavMode('orbit'));
+    document.addEventListener('pointerlockerror', () => this.setNavMode('orbit'));
     this.scene.add(this.pointerLock.object);
 
     this.navMode = 'orbit';
@@ -118,9 +121,9 @@ export class ModelViewer {
     this.pointer = new THREE.Vector2();
 
     // --- Display ------------------------------------------------------------
-    this.layers = { mesh: true, splat: true, points: false, grid: true };
+    this.layers = { mesh: true, splat: false, points: false, grid: true };
     this.shading = 'authored'; // authored | shaded | flat
-    this.objects = { mesh: null, splat: null, cloud: null };
+    this.objects = { mesh: null, cloud: null };
     this.pointSize = 0.08;
 
     this.onMeasure = null;
@@ -158,7 +161,7 @@ export class ModelViewer {
       .setKTX2Loader(this.ktx2Loader)
       .setMeshoptDecoder(MeshoptDecoder);
     this.plyLoader = new PLYLoader();
-    this.splatLoader = new GaussianSplatPLYLoader();
+    this.splatView = new SplatView(canvas);
 
     this.needsRender = true;
     this.clock = new THREE.Clock();
@@ -201,6 +204,8 @@ export class ModelViewer {
     window.addEventListener('keydown', (event) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       this.keys.add(event.code);
+      // Space climbs in fly mode; it must not also press a focused button.
+      if (this.navMode !== 'orbit' && event.code === 'Space') event.preventDefault();
       // Shift sprints; a town is large and walking it at 1x is tedious.
       if (event.code === 'Escape' && this.navMode !== 'orbit') this.setNavMode('orbit');
     });
@@ -235,6 +240,8 @@ export class ModelViewer {
       this.orbit.update();
     } else {
       this.orbit.enabled = false;
+      // A focused slider would otherwise swallow the movement keys.
+      document.activeElement?.blur?.();
       this.pointerLock.lock();
       if (mode === 'walk') this.snapToGround();
     }
@@ -334,7 +341,8 @@ export class ModelViewer {
       }
       if (node.geometry?.getAttribute('color')) hasVertexColor = true;
       if (material) {
-        material.side = THREE.DoubleSide;
+        // Estimated ground is one-sided: from below it must not hide the model.
+        material.side = node.geometry?.userData.skyforgeGround ? THREE.FrontSide : THREE.DoubleSide;
         material.needsUpdate = true;
       }
     });
@@ -428,23 +436,18 @@ export class ModelViewer {
   }
 
   /**
-   * 3D Gaussian splat.
-   *
-   * three 0.186 renders splats natively (GaussianSplat extends Mesh), so this
-   * needs no extra renderer and no third-party library. There is no LOD here,
-   * so a very large scene is limited by VRAM rather than streamed.
+   * 3D Gaussian splat, drawn on its own canvas (see viewer/splat-view.js).
+   * It is stored in the reconstruction frame, so it needs the job's transform
+   * (from setViews) to overlay the mesh.
    */
   async loadSplat(url) {
+    const generation = this.generation;
     const packed = await this.fetchWithProgress(url);
-    const geometry = this.splatLoader.parse(packed.buffer);
-    this.disposeObject(this.objects.splat);
-    const splat = new GaussianSplat(geometry);
-    splat.name = 'GaussianSplat';
-    this.objects.splat = splat;
-    this.root.add(splat);
-    if (!this.objects.mesh) this.fit(splat);
+    const loaded = await this.splatView.load(packed.buffer, this.views?.reconstructionToViewer, this.views?.focus);
+    // The operator may have opened another job while this downloaded.
+    if (generation !== this.generation) { this.splatView.clear(); throw new Error('Superseded by another model.'); }
     this.applyLayers();
-    return { count: geometry.getAttribute('position')?.count || 0 };
+    return loaded;
   }
 
   disposeObject(object) {
@@ -472,6 +475,8 @@ export class ModelViewer {
     this.closeLod();
     this.overlay.detach();
     this.clearHighlight();
+    this.generation = (this.generation || 0) + 1;
+    this.splatView.clear();
     for (const key of Object.keys(this.objects)) {
       this.disposeObject(this.objects[key]);
       this.objects[key] = null;
@@ -529,6 +534,7 @@ export class ModelViewer {
   setViews(data, { jump = true } = {}) {
     this.views = data;
     if (!data) { this.setFocusClip(false); return; }
+    this.splatView.align(data.reconstructionToViewer);
     // Speeds, markers and walking scale with the filmed area, not the horizon.
     this.boundsRadius = Math.max(10, data.focus.radius);
     this.moveSpeed = Math.max(0.1, this.boundsRadius / 60);
@@ -602,7 +608,7 @@ export class ModelViewer {
   applyLayers() {
     const comparing = this.comparison.active;
     if (this.objects.mesh) this.objects.mesh.visible = !comparing && this.layers.mesh !== false;
-    if (this.objects.splat) this.objects.splat.visible = !comparing && this.layers.splat !== false;
+    this.splatView.setVisible(!comparing && this.layers.splat === true);
     if (this.objects.cloud) this.objects.cloud.visible = !comparing && this.layers.points === true;
     this.grid.visible = this.layers.grid !== false;
     this.invalidate();
@@ -633,7 +639,7 @@ export class ModelViewer {
           map: authored.map || null,
           color: authored.map ? 0xffffff : (authored.color || new THREE.Color(0xffffff)),
           vertexColors: Boolean(node.geometry.getAttribute('color')) && !authored.map,
-          side: THREE.DoubleSide,
+          side: authored.side,
           toneMapped: false,
         });
       } else {
@@ -643,7 +649,7 @@ export class ModelViewer {
           vertexColors: Boolean(node.geometry.getAttribute('color')) && !authored.map,
           roughness: 0.95,
           metalness: 0,
-          side: THREE.DoubleSide,
+          side: authored.side,
         });
       }
       node.material.wireframe = this.wireframe;
@@ -950,7 +956,8 @@ export class ModelViewer {
       this.perf.fps = this.perf.fps == null ? fps : this.perf.fps * 0.9 + fps * 0.1;
     }
     this.perf.last = now;
-    if (this.comparison.active) this.comparison.render(this.renderer, this.scene, this.camera);
+    if (this.splatView.visible) this.splatView.render(this.camera);
+    else if (this.comparison.active) this.comparison.render(this.renderer, this.scene, this.camera);
     else this.renderer.render(this.scene, this.camera);
     const spent = performance.now() - now;
     this.perf.frameMs = this.perf.frameMs == null ? spent : this.perf.frameMs * 0.9 + spent * 0.1;

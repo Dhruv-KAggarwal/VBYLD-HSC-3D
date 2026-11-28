@@ -61,7 +61,7 @@ export function EnhancementDrawer({
       binaries.current.clear();
       await refresh();
       // A finished repair or LOD run changes what should be on screen.
-      if (next.status === 'complete' && (next.operation === 'repair' || next.operation === 'lod')) onReload();
+      if (next.status === 'complete' && ['repair', 'lod', 'completion'].includes(next.operation)) onReload();
     });
   }, [jobId, refresh, onReload]);
 
@@ -118,6 +118,12 @@ export function EnhancementDrawer({
       data.current.confidence = null;
       setOverlayNotice(null);
       if (!jobId || !artifacts) { viewer.setOverlayData(null); return; }
+      // Overlays are recorded per face of the reconstruction, not of the filled copy.
+      if (viewer.objects.mesh?.userData.completed) {
+        viewer.setOverlayData(null);
+        if (wanted !== 'off') setOverlayNotice('Turn off "Filled sides" to see this overlay.');
+        return;
+      }
       const repaired = artifacts.activeModel === 'repaired';
       const confidenceState = artifacts.artifacts[repaired ? 'confidenceRepaired' : 'confidence'];
       let confidence = null;

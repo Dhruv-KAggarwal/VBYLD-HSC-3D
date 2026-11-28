@@ -1,3 +1,4 @@
+import { estimateUp } from '../lib/gravity.mjs';
 import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync, readSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -111,6 +112,24 @@ const rapidStarved = qualitySettings('fast', 67.26, { frames: 40 }, laptop);
 check('a low frame override cannot starve rapid', rapidStarved.targetFrames >= 130);
 const rapidHover = qualitySettings('fast', 10, {}, laptop);
 check('rapid still samples a short hover', rapidHover.targetFrames >= 72 && rapidHover.targetFrames <= 120, String(rapidHover.targetFrames));
+
+// A straight pass climbing 20 degrees while looking 25 degrees down, over level
+// ground with one facade in view. World up is +Y.
+const climbing = Array.from({ length: 20 }, (_, i) => {
+  const [c, s] = [Math.cos((25 * Math.PI) / 180), Math.sin((25 * Math.PI) / 180)];
+  return {
+    name: `frame_${String(i).padStart(6, '0')}.jpg`,
+    center: [0, 50 + i * Math.tan((20 * Math.PI) / 180), i],
+    rightAxis: [-1, 0, 0],
+    viewAxis: [0, -s, c],
+    downAxis: [0, -c, -s],
+  };
+});
+const surfaces = new Float32Array(3000 * 3);
+for (let i = 0; i < 3000; i += 1) surfaces.set(i < 2400 ? [0, 1, 0] : [0, 0, -1], i * 3);
+const level = estimateUp(climbing, surfaces);
+check('a climbing straight pass is levelled from the ground', level.method === 'level-surfaces' && level.up[1] > 0.999, `${level.method} ${level.up}`);
+check('without surface normals the camera estimate is kept', estimateUp(climbing, null).method === 'colmap-cameras');
 
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

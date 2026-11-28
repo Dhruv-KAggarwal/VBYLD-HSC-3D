@@ -27,7 +27,7 @@ const tool = option('tool');
 
 if (!inputs.length && !reuse) {
   console.error('Usage: node reconstruct-cli.mjs <video.mp4> [more videos…] [--fast|--balanced|--detailed]');
-  console.error('         [--frames=64] [--threads=8] [--altitude=82] [--repair] [--confidence] [--lod]');
+  console.error('         [--frames=64] [--threads=8] [--altitude=82] [--repair] [--confidence] [--lod] [--fill]');
   console.error('   or: node reconstruct-cli.mjs --reuse=runtime/<job-id> [--view|--full] [--altitude=82]');
   console.error(`   or: node reconstruct-cli.mjs --tool=${OPERATIONS.join('|')} --reuse=runtime/<job-id> [--settings=<json>]`);
   process.exit(1);
@@ -81,6 +81,7 @@ const job = {
   enhance: normalizeEnhance({
     analysis: args.includes('--repair') || args.includes('--analyze'),
     repair: args.includes('--repair'),
+    completion: args.includes('--fill'),
     confidence: args.includes('--confidence'),
     lod: args.includes('--lod'),
   }),

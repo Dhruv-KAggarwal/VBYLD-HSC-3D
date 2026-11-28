@@ -160,6 +160,8 @@ videos ─► multivideo/  sample · dedup · per-video features · intra + cros
 | `meshrepair/` | Analysis, cleanup, floating components, hole classification and filling, smoothing, appearance, provenance. |
 | `confidence/` | Visibility depth buffers, viewing angles, reprojection, point support, depth agreement, scoring, regions, exports. |
 | `lod/` | meshoptimizer simplification, atlas re-baking, error measurement, attribute transfer. |
+| `gravity.mjs` | Which way is up: camera right axes when the flight turns, roof and ground normals when it holds one heading. `tools/relevel.mjs` applies it to finished jobs. |
+| `completion/` | Fills unseen sides after repair: removes grey and edge-on faces, levels the scene, estimates ground and walls, copies photographed facades onto them. Writes `model-completed.glb`; estimates are for viewing, not measuring. |
 | `artifacts.mjs` | Content fingerprints so a derived product is never served after its source changed. |
 | `enhance/` | Job context in the mesh frame, worker thread and runner. |
 | `uploads.mjs`, `tasks.mjs`, `api.mjs` | Staged uploads, background tasks, the added routes. |

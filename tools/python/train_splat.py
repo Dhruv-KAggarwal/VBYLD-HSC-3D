@@ -232,7 +232,9 @@ def knn_spacing(points: np.ndarray, k: int = 4) -> np.ndarray:
     Gaussians. Chunked so a large cloud does not allocate an N x N matrix."""
     tensor = torch.from_numpy(points).float().cuda()
     out = torch.empty(len(points), device="cuda")
-    chunk = 4096
+    # Each block is a chunk x N distance matrix: size it to about 1 GB so a large
+    # cloud does not exhaust a 6 GB card before training starts.
+    chunk = max(64, min(4096, int(2.5e8 // max(1, len(points)))))
     for start in range(0, len(points), chunk):
         block = tensor[start:start + chunk]
         dist = torch.cdist(block, tensor)

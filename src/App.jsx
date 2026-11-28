@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelViewer } from './viewer.js';
 import {
-  cancelJob, fileUrl, fileUrlFresh, getArtifacts, getHealth, getJobFiles, getLodManifest, getViews, listJobs, lodUrl,
-  startMultiReconstruction, startReconstruction, watchJob,
+  cancelJob, fileUrl, fileUrlFresh, getArtifacts, getHealth, getJobFiles, getLodManifest, getViews, hasFile, listJobs, lodUrl,
+  completionUrl, startCompletion, startMultiReconstruction, startReconstruction, watchJob, watchTask,
 } from './api.js';
 import { TurntablePlayer } from './TurntablePlayer.jsx';
 import { MultiVideoUpload } from './components/MultiVideoUpload.jsx';
@@ -10,6 +10,7 @@ import { DRAWER_TABS, EnhancementDrawer } from './components/EnhancementDrawer.j
 import { REPAIR_DEFAULTS, RepairSettings } from './components/MeshRepairPanel.jsx';
 import { DroneViews } from './components/DroneViews.jsx';
 import { Collapsible, Segmented, Toggle, formatBytes, formatDuration } from './components/ui.jsx';
+import { useFullscreen } from './useFullscreen.js';
 
 const QUALITY = [
   { id: 'Rapid', title: 'Rapid', note: 'Fastest. 1280px frames, no mesh refinement.' },
@@ -40,6 +41,7 @@ function clockOf(at) {
 const DOWNLOADS = [
   ['glb', 'Textured mesh (GLB)'],
   ['repaired', 'Repaired mesh (GLB)'],
+  ['completed', 'Filled mesh, estimated sides (GLB)'],
   ['video', 'Turntable video (MP4)'],
   ['cloud', 'Point cloud (PLY)'],
   ['mesh', 'Raw mesh (PLY)'],
@@ -59,6 +61,7 @@ export default function App() {
   const viewerRef = useRef(null);
   const unwatchRef = useRef(null);
   const logRef = useRef(null);
+  const fullscreen = useFullscreen(viewerRef);
 
   const [health, setHealth] = useState(null);
   const [jobs, setJobs] = useState([]);
@@ -106,14 +109,26 @@ export default function App() {
     lod: true,
     repair: false,
     repairSettings: { ...REPAIR_DEFAULTS },
+    completion: true,
   });
 
   const [display, setDisplay] = useState({
     nav: 'orbit',
     measure: 'off',
     shading: 'authored',
-    layers: { mesh: true, splat: true, points: false, grid: true },
+    layers: { mesh: true, splat: false, points: false, grid: true },
   });
+
+  // The filled model: whether this job has one, and whether it is on screen.
+  const [fill, setFill] = useState({ id: null, ready: false, shown: false, progress: null });
+  const showFilledRef = useRef(true);
+  const fillWatchRef = useRef(null);
+  const shownJobRef = useRef(null);
+  shownJobRef.current = job;
+  useEffect(() => {
+    fillWatchRef.current?.();
+    setFill({ id: null, ready: false, shown: false, progress: null });
+  }, [job?.id]);
 
   const pushLog = useCallback((text, kind = 'info') => {
     setLog((prev) => [...prev.slice(-400), { text, kind, at: Date.now() }]);
@@ -133,6 +148,7 @@ export default function App() {
     viewer.onMeasure = ({ message }) => setMeasureText(message || '');
     viewer.onNavChange = ({ mode, speed }) => {
       const found = NAV_MODES.find((m) => m.id === mode);
+      setDisplay((d) => (d.nav === mode ? d : { ...d, nav: mode }));
       setNavHint(`${found?.hint || ''} · speed ${speed.toFixed(2)}`);
     };
     return () => { viewer.clearModel(); };
@@ -188,7 +204,26 @@ export default function App() {
       let hasTexture = false;
       let hasVertexColor = false;
       let levels = false;
-      if (artifacts?.artifacts.lod.current) {
+      const completion = artifacts?.artifacts.completion;
+      let filled = false;
+      if (completion?.current && showFilledRef.current) {
+        try {
+          const loaded = await viewer.loadModelData(completionUrl(target.id, completion.createdAt), { quiet: false });
+          if (!current()) { viewer.disposeObject(loaded.model); return; }
+          viewer.closeLod();
+          loaded.model.userData.completed = true;
+          viewer.showModel(loaded.model, { fit: true });
+          ({ hasTexture, hasVertexColor } = loaded);
+          filled = true;
+          pushLog('Loaded with unseen sides filled in. Those parts are estimates: measure on the original.', 'ok');
+        } catch (fillError) {
+          if (!current()) return;
+          pushLog(`Filled model unavailable (${fillError.message}); loading the reconstruction`, 'warn');
+        }
+      }
+      if (!current()) return;
+      setFill((f) => ({ ...f, id: target.id, ready: Boolean(completion?.current), shown: filled }));
+      if (!filled && artifacts?.artifacts.lod.current) {
         try {
           const manifest = await getLodManifest(target.id);
           if (!current()) return;
@@ -206,7 +241,7 @@ export default function App() {
           pushLog(`Levels of detail unavailable (${lodError.message}); loading the full model`, 'warn');
         }
       }
-      if (!levels) {
+      if (!levels && !filled) {
         const url = artifacts?.activeModel === 'repaired'
           ? fileUrlFresh(target.id, 'repaired', artifacts.artifacts.repair.createdAt)
           : fileUrlFresh(target.id, 'glb', artifacts?.artifacts.repair.createdAt || target.id);
@@ -233,12 +268,9 @@ export default function App() {
         cloud: false,
       };
 
-      // The splat is optional and may not exist for this job.
-      try {
-        const splat = await viewer.loadSplat(fileUrl(target.id, 'splat'));
-        info.splat = true;
-        pushLog(`Loaded Gaussian splat (${splat.count.toLocaleString()} splats)`, 'ok');
-      } catch { /* no splat for this job */ }
+      // The splat is large, so it is downloaded only when asked for.
+      info.splat = await hasFile(target.id, 'splat');
+      setDisplay((d) => ({ ...d, layers: { ...d.layers, mesh: true, splat: false } }));
 
       if (current()) setSceneInfo(info);
     } catch (loadError) {
@@ -249,6 +281,56 @@ export default function App() {
       if (current()) setLoadPct(null);
     }
   }, [pushLog]);
+
+  /** Show or hide the estimated sides, generating them the first time. */
+  const toggleFill = useCallback(async () => {
+    const id = job?.id;
+    if (!id || fill.progress != null) return;
+    if (fill.ready) {
+      showFilledRef.current = !fill.shown;
+      loadResult(job, { keepCamera: true });
+      return;
+    }
+    try {
+      const { task } = await startCompletion(id);
+      setFill((f) => ({ ...f, progress: task.progress || 0 }));
+      fillWatchRef.current?.();
+      fillWatchRef.current = watchTask(id, (next) => {
+        const active = next && (next.status === 'queued' || next.status === 'running');
+        setFill((f) => ({ ...f, progress: active ? next.progress : null }));
+        if (active) return;
+        if (next?.status === 'complete') {
+          pushLog(next.summary || 'Unseen sides filled', 'ok');
+          showFilledRef.current = true;
+          // Another job may have been opened while this one was being filled.
+          if (shownJobRef.current?.id === id) loadResult(shownJobRef.current, { keepCamera: true });
+        } else if (next?.error) pushLog(`Could not fill the unseen sides: ${next.error}`, 'error');
+      });
+    } catch (fillError) {
+      pushLog(`Could not fill the unseen sides: ${fillError.message}`, 'error');
+    }
+  }, [job, fill, loadResult, pushLog]);
+
+  /** Switch between the mesh and the photoreal splat. */
+  const toggleSplat = useCallback(async () => {
+    const viewer = viewerRef.current;
+    const id = job?.id;
+    if (!viewer || !id) return;
+    const on = !display.layers.splat;
+    if (on && !viewer.splatView.splat) {
+      setLoadPct({ pct: 0, loaded: 0, total: 0 });
+      try {
+        const { count, removed } = await viewer.loadSplat(fileUrl(id, 'splat'));
+        pushLog(`Loaded Gaussian splat (${count.toLocaleString()} splats, ${removed.toLocaleString()} distant strays hidden). Measuring uses the mesh view.`, 'ok');
+      } catch (splatError) {
+        pushLog(`Could not show the splat: ${splatError.message}`, 'error');
+        return;
+      } finally {
+        setLoadPct(null);
+      }
+    }
+    setDisplay((d) => ({ ...d, measure: on ? 'off' : d.measure, layers: { ...d.layers, splat: on, mesh: true } }));
+  }, [job?.id, display.layers.splat, pushLog]);
 
   const loadCloud = useCallback(async () => {
     const viewer = viewerRef.current;
@@ -286,6 +368,7 @@ export default function App() {
         lod: options.lod,
         repair: options.repair,
         repairSettings: options.repairSettings,
+        completion: options.completion,
       };
       const { id } = multi
         ? await startMultiReconstruction(session.id, { ...options, enhance })
@@ -320,7 +403,8 @@ export default function App() {
           // Only load here if the early-release effect has not already done it.
           // Repair and LOD finish after the early release, so load again for them.
           const derived = await getArtifacts(next.id).catch(() => null);
-          const changed = derived?.artifacts.lod.current || derived?.activeModel === 'repaired';
+          const changed = derived?.artifacts.lod.current || derived?.activeModel === 'repaired'
+            || derived?.artifacts.completion?.current;
           if (loadedForRef.current !== next.id || changed) {
             const again = loadedForRef.current === next.id;
             loadedForRef.current = next.id;
@@ -375,6 +459,29 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [start]);
+
+  const chooseNav = useCallback((id) => {
+    const mode = NAV_MODES.find((m) => m.id === id);
+    setDisplay((d) => ({ ...d, nav: id }));
+    setNavHint(mode.hint);
+    viewerRef.current?.setNavMode(id);
+  }, []);
+
+  // F toggles fullscreen and 1/2/3 pick the navigation mode. The keys matter in
+  // fly and walk, where the mouse is captured and no button can be clicked.
+  const toggleFullscreen = fullscreen.toggle;
+  useEffect(() => {
+    if (!modelAvailable) return undefined;
+    const onKey = (event) => {
+      if (event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.target.matches?.('input:not([type="range"], [type="checkbox"]), textarea, select')) return;
+      if (event.code === 'KeyF') { event.preventDefault(); toggleFullscreen(); return; }
+      const mode = NAV_MODES[['Digit1', 'Digit2', 'Digit3'].indexOf(event.code)];
+      if (mode && sceneView === 'viewer') { event.preventDefault(); chooseNav(mode.id); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modelAvailable, sceneView, toggleFullscreen, chooseNav]);
 
   // Offer only the outputs that exist on disk.
   useEffect(() => {
@@ -608,6 +715,11 @@ export default function App() {
               onChange={(v) => setOptions((o) => ({ ...o, repair: v }))}
               label="Automatic mesh repair" note="Writes a repaired copy; the original is always kept."
             />
+            <Toggle
+              checked={options.completion} disabled={busy}
+              onChange={(v) => setOptions((o) => ({ ...o, completion: v }))}
+              label="Fill unseen sides" note="Estimates walls and ground the drone never saw. For viewing, not measuring."
+            />
             {options.repair && (
               <Collapsible title="Repair settings">
                 <RepairSettings value={options.repairSettings} disabled={busy} onChange={(repairSettings) => setOptions((o) => ({ ...o, repairSettings }))} />
@@ -664,7 +776,7 @@ export default function App() {
 
       {/* ------------------------------------------------- scene + progress */}
       <main className="h-full min-h-0 max-md:h-[100vh] grid grid-rows-[minmax(0,1fr)_auto] min-w-0">
-        <div className="relative min-h-0 flex overflow-clip">
+        <div ref={fullscreen.ref} className="relative min-h-0 flex overflow-clip bg-ink-950">
         <div className="relative min-h-0 min-w-0 flex-1 bg-ink-950">
           <canvas ref={canvasRef} className="scene-canvas" />
 
@@ -682,17 +794,24 @@ export default function App() {
               ))}
             </div>
 
+            {modelAvailable && (
+            <div className="panel flex p-1 gap-1">
+              <button
+                className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent ${fullscreen.active ? 'btn-toggle-on' : ''}`}
+                aria-pressed={fullscreen.active}
+                title={fullscreen.active ? 'Leave fullscreen (F)' : 'View the model fullscreen (F)'}
+                onClick={(e) => { e.currentTarget.blur(); fullscreen.toggle(); }}
+              >⛶ {fullscreen.active ? 'Exit fullscreen' : 'Fullscreen'}</button>
+            </div>
+            )}
+
             {sceneView === 'viewer' && (
             <div className="panel flex p-1 gap-1">
               {NAV_MODES.map((mode) => (
                 <button
                   key={mode.id}
                   className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent ${display.nav === mode.id ? 'btn-toggle-on' : ''}`}
-                  onClick={() => {
-                    setDisplay((d) => ({ ...d, nav: mode.id }));
-                    viewerRef.current?.setNavMode(mode.id);
-                    setNavHint(mode.hint);
-                  }}
+                  onClick={() => chooseNav(mode.id)}
                 >{mode.label}</button>
               ))}
             </div>
@@ -765,9 +884,25 @@ export default function App() {
                 key={key}
                 disabled={!available}
                 className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent justify-start ${display.layers[key] ? 'btn-toggle-on' : ''}`}
-                onClick={() => setDisplay((d) => ({ ...d, layers: { ...d.layers, [key]: !d.layers[key] } }))}
+                onClick={() => {
+                  if (key === 'splat') toggleSplat();
+                  // Choosing the mesh while the splat covers it brings the mesh back.
+                  else if (key === 'mesh' && display.layers.splat) setDisplay((d) => ({ ...d, layers: { ...d.layers, splat: false, mesh: true } }));
+                  else setDisplay((d) => ({ ...d, layers: { ...d.layers, [key]: !d.layers[key] } }));
+                }}
               >{label}</button>
             ))}
+            {modelAvailable && !busy && (
+              <button
+                className={`btn py-1 px-2.5 text-xs border-transparent bg-transparent justify-start ${fill.shown ? 'btn-toggle-on' : ''}`}
+                aria-pressed={fill.shown}
+                disabled={fill.progress != null}
+                title="Estimated walls and ground where the drone never looked. Not for measuring."
+                onClick={toggleFill}
+              >
+                {fill.progress != null ? `Filling ${Math.round(fill.progress)}%` : fill.ready ? 'Filled sides' : '+ Fill sides'}
+              </button>
+            )}
             {job?.id && !sceneInfo?.cloud && (
               <button className="btn py-1 px-2.5 text-xs border-transparent bg-transparent justify-start" onClick={loadCloud}>
                 + Load cloud
@@ -782,7 +917,10 @@ export default function App() {
 
           {/* hints + measurement readout */}
           <div className="absolute bottom-3 left-3 right-3 flex items-end justify-between gap-3 pointer-events-none">
-            <div className="panel px-3 py-2 kicker normal-case tracking-normal text-mist-400">{navHint}</div>
+            <div className="panel px-3 py-2 kicker normal-case tracking-normal text-mist-400">
+              {navHint}{modelAvailable ? ' · 1 orbit, 2 fly, 3 walk, F fullscreen' : ''}
+              {fill.shown ? ' · filled sides are estimates' : ''}
+            </div>
             {measureText && (
               <div className="panel px-3 py-2 text-sm text-jet-400 font-mono">{measureText}</div>
             )}

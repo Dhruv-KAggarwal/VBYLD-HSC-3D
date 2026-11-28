@@ -45,10 +45,8 @@ const tasks = createTaskManager();
 /**
  * Splat-trainer availability, probed once and cached.
  *
- * detectSplat shells out to Python to check for torch and gsplat, which takes
- * seconds. Calling it inside the /api/health handler blocked the event loop
- * for long enough that the request timed out. Probe lazily on first use, then
- * reuse; a trainer installed while the server is running needs a restart,
+ * detectSplat shells out to Python to check for torch and gsplat, and
+ * spawnSync blocks the event loop. Probe lazily on first use, then reuse; a trainer installed while the server is running needs a restart,
  * which is the same as every other engine here.
  */
 let splatProbe = null;
@@ -279,6 +277,7 @@ function fileFor(job, kind) {
     // Enhancement products belong to one job; none of them falls back.
     original: [join(recovered, 'model.glb')],
     repaired: [join(recovered, 'model-repaired.glb')],
+    completed: [join(recovered, 'model-completed.glb')],
     removed: [join(recovered, 'repair', 'removed.glb')],
     'repair-report': [join(recovered, 'repair', 'repair-report.json')],
     'confidence-glb': [join(recovered, 'confidence', 'confidence.glb')],
@@ -293,7 +292,7 @@ function fileFor(job, kind) {
 
 /** Every kind fileFor understands, for the downloads list and HEAD probes. */
 const FILE_KINDS = ['glb', 'splat', 'terrain', 'full', 'cloud', 'mesh', 'ortho', 'meta', 'video', 'poster',
-  'report', 'original', 'repaired', 'removed', 'repair-report', 'confidence-glb', 'confidence-ply', 'confidence-bin', 'confidence-report', 'lod-report'];
+  'report', 'original', 'repaired', 'completed', 'removed', 'repair-report', 'confidence-glb', 'confidence-ply', 'confidence-bin', 'confidence-report', 'lod-report'];
 
 /**
  * Serve a file, honouring HTTP byte ranges.

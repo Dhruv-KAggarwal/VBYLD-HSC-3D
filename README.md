@@ -151,6 +151,12 @@ Three navigation modes, because orbit alone is useless at ground level:
   speed, Esc to exit.
 - **Walk** — street level, camera pinned to eye height above the surface.
 
+**Splat view.** *Splat* in the layer panel downloads and shows the Gaussian
+splat on the same camera (WebGPU, or its WebGL fallback). It looks close to the
+video near the flight path and breaks into streaks from angles the drone never
+flew, such as straight down; switch to *Mesh* there, and for measuring. Splats
+left at extreme distances by training are hidden on load.
+
 **Drone views.** A reconstruction opens looking through one of the video's own
 cameras. The slider steps along the flight, *Overview* frames the filmed area,
 and *Filmed area only* hides the thinly observed surroundings out to the horizon

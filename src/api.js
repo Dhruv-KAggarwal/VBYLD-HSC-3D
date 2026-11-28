@@ -257,6 +257,8 @@ export const getMeshQuality = async (id) => {
 };
 export const startRepair = (id, settings) => request(job(id, 'repair'), json('POST', settings));
 export const getRepairReport = (id) => request(job(id, 'repair-report'));
+export const startCompletion = (id) => request(job(id, 'completion'), json('POST', {}));
+export const completionUrl = (id, token = '') => `${API}${job(id, 'completion/model')}?t=${encodeURIComponent(token)}`;
 export const startConfidence = (id, settings) => request(job(id, 'confidence/analyze'), json('POST', settings));
 export const getConfidence = (id, model) => request(job(id, `confidence${model ? `?model=${model}` : ''}`));
 export const getConfidenceRegions = (id, model) => request(job(id, `confidence/regions${model ? `?model=${model}` : ''}`));
